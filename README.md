@@ -12,16 +12,18 @@ Contents included in this branch:
 - `tests/headless_test.py` — headless test helper (optional).
 
 Not included
+
 - `data/images/` (image files) are ignored to avoid committing photos.
 - `.env` (contains keys) is not included. Supabase-related files (e.g. `db_supabase.py`) are present in the repo but not used by the local Flask UI by default.
 
 How this project stores data
+
 - By default the Flask app stores registered user names in `data/names.pkl` and face embeddings in `data/faces_data.pkl`. Captured images are written to `data/images/<name>/`.
 - The current local UI does NOT require any remote DB; Supabase helper code exists in the repo but is not used by the UI unless you wire it up and provide credentials.
 
 Quick start (Windows / PowerShell)
 
-1) Create / activate conda env and install dependencies (or use your existing env with dlib/face_recognition installed):
+1. Create / activate conda env and install dependencies (or use your existing env with dlib/face_recognition installed):
 
 ```powershell
 conda create -n face-recognition-project python=3.8 -y
@@ -31,7 +33,7 @@ conda install -n face-recognition-project -c conda-forge dlib face_recognition o
 pip install -r "C:\Users\uses\Downloads\face recognition\requirements.txt"
 ```
 
-2) Run the app (foreground, so you can see logs):
+2. Run the app (foreground, so you can see logs):
 
 ```powershell
 conda activate face-recognition-project
@@ -39,14 +41,17 @@ python -u "C:\Users\uses\Downloads\face recognition\webapp.py"
 # Open http://127.0.0.1:5000 in your browser
 ```
 
-3) Use the UI:
+3. Use the UI:
+
 - Click "Sign Up" → enter a name → click Register (the UI will start the camera and capture frames).
 - Click "Login (5s)" → the UI will capture frames for up to 5s and redirect to a welcome page on success.
 
 Security notes
+
 - This is a demo/local prototype. Do not expose it publicly without adding authentication, HTTPS, and anti-spoofing/liveness checks.
 
 If you want me to push the code to your GitHub repo or adjust which files are included, tell me and I will push to a branch (default: `feature/faceauth`).
+
 # Face Recognition Attendance System with Supabase# face_recognition_project
 
 ## Overview
