@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Face Login / Sign Up</title>
+    <style>
+      :root{ --accent:#2563eb; }
+      body { font-family: Arial, sans-serif; padding: 24px; background:#fafafa; color:#111 }
+      .container { max-width:980px; margin:0 auto }
+      header { margin-bottom:16px }
+      h1{ margin:0; font-size:24px }
+      .subtitle{ color:#555 }
+      .app{ display:flex; gap:20px; align-items:flex-start }
+      .camera-area { flex:0 0 480px }
+      video { width:100%; height:auto; background:#000; border-radius:6px; border:1px solid #ddd }
+      .panel{ flex:1 }
+      .actions{ margin-bottom:12px }
+      button.primary{ background:var(--accent); color:white; border:none; padding:10px 14px; border-radius:6px; cursor:pointer }
+      button{ font-size:14px }
+      .hidden{ display:none !important }
+      .status{ margin-top:8px; color:#333 }
+      .messages{ margin-top:12px; color:#111; min-height:40px }
+      form label{ display:block; margin-bottom:6px }
+      input[type=text]{ width:100%; padding:8px; border:1px solid #ddd; border-radius:6px }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>FaceAuth</h1>
+        <p class="subtitle">Sign up or login with your face</p>
+      </header>
+
+      <div class="app">
+        <div class="camera-area">
+          <video id="video" class="hidden" autoplay playsinline muted></video>
+          <div id="status" class="status hidden">Camera not started</div>
+        </div>
+
+        <div class="panel">
+          <div class="actions">
+            <button id="show-signup" class="primary">Sign Up</button>
+            <button id="login" class="primary">Login (5s)</button>
+          </div>
+
+          <form id="signup-form" class="hidden">
+            <label for="name-input">Full name</label>
+            <input id="name-input" type="text" placeholder="e.g. Alice" />
+            <div class="signup-actions">
+              <button id="signup-cancel" type="button">Cancel</button>
+              <button id="signup" type="button" class="primary">Register</button>
+            </div>
+          </form>
+
+          <div id="messages" class="messages" aria-live="polite"></div>
+        </div>
+      </div>
+
+      <footer>
+        <small>Tip: make sure your face is centered and well lit.</small>
+      </footer>
+    </div>
+
+    <script>
+      const video = document.getElementById('video')
+      const status = document.getElementById('status')
+      const log = document.getElementById('log')
+
+      let _cameraStream = null
+      async function startCamera(){
+        if(_cameraStream) return // already started
+        try{
+          const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+          _cameraStream = stream
+          video.srcObject = stream
+          await video.play()
+          video.classList.remove('hidden')
+          status.classList.remove('hidden')
+          status.textContent = 'Camera ready'
+        }catch(e){
+          status.classList.remove('hidden')
+          status.textContent = 'Camera error: ' + e.message
+        }
+      }
+
+      function stopCamera(){
+        if(!_cameraStream) return
+        try{
+          _cameraStream.getTracks().forEach(t=>t.stop())
+        }catch(e){ }
+        _cameraStream = null
+        video.srcObject = null
+        video.classList.add('hidden')
+        status.classList.add('hidden')
+      }
+
+      function captureFrame(){
+        const canvas = document.createElement('canvas')
+        canvas.width = video.videoWidth || 640
+        canvas.height = video.videoHeight || 480
+        const ctx = canvas.getContext('2d')
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+        return canvas.toDataURL('image/jpeg', 0.8)
+      }
+
+      async function postForm(url, formData){
+        const resp = await fetch(url, { method: 'POST', body: formData })
+        return resp.json()
+      }
+
+      // UI controls
+      const showSignupBtn = document.getElementById('show-signup')
+      const signupForm = document.getElementById('signup-form')
+      const signupCancel = document.getElementById('signup-cancel')
+      const signupBtn = document.getElementById('signup')
+      const nameInput = document.getElementById('name-input')
+      const messages = document.getElementById('messages')
+
+      showSignupBtn.addEventListener('click', async ()=>{
+        // start camera when user opens signup
+        await startCamera()
+        signupForm.classList.remove('hidden')
+        nameInput.focus()
+      })
+      signupCancel.addEventListener('click', ()=>{
+        signupForm.classList.add('hidden')
+        stopCamera()
+      })
+
+      signupBtn.addEventListener('click', async ()=>{
+        const name = nameInput.value.trim()
+        if(!name){
+          messages.textContent = 'Please enter your name.'
+          return
+        }
+        messages.textContent = 'Registering — capturing frames. Keep your face centered.'
+        const maxTries = 5
+        const interval = 600
+        let success = false
+        for(let i=0;i<maxTries && !success;i++){
+          const dataUrl = captureFrame()
+          const fd = new FormData()
+          fd.append('name', name)
+          fd.append('image', dataUrl)
+          try{
+            const res = await postForm('/signup', fd)
+            if(res.ok){
+              messages.textContent = `Registered ${res.name}. You can now login.`
+              signupForm.classList.add('hidden')
+              success = true
+              break
+            }else{
+              messages.textContent = res.detail || res.error || 'No face detected — try again.'
+            }
+          }catch(e){
+            messages.textContent = 'Sign up failed: ' + e.message
+            break
+          }
+          await new Promise(r=>setTimeout(r, interval))
+        }
+        if(!success){
+          messages.textContent = 'Registration unsuccessful. Make sure you are well lit and camera is focused on your face.'
+          // stop camera after attempts
+          stopCamera()
+        }
+        else { stopCamera() }
+      })
+
+      document.getElementById('login').addEventListener('click', async ()=>{
+        // start camera when attempting login
+        await startCamera()
+        messages.textContent = 'Attempting login for up to 5 seconds...'
+        const start = Date.now()
+        const timeout = 5000
+        const interval = 500
+        let found = false
+        while(Date.now() - start < timeout && !found){
+          const dataUrl = captureFrame()
+          const fd = new FormData()
+          fd.append('image', dataUrl)
+          try{
+            const res = await postForm('/login', fd)
+            if(res.ok){
+              // redirect to welcome page
+              stopCamera()
+              window.location = `/welcome?name=${encodeURIComponent(res.name)}`
+              found = true
+              break
+            }else{
+              messages.textContent = 'Trying... (' + ((Date.now()-start)/1000).toFixed(1) + 's)'
+              if(res.error === 'no_registered'){
+                messages.textContent = 'No users registered. Please sign up first.'
+                break
+              }
+            }
+          }catch(e){
+            messages.textContent = 'Login error: ' + e.message
+            break
+          }
+          await new Promise(r=>setTimeout(r, interval))
+        }
+        if(!found && messages.textContent.indexOf('No users')===-1){
+          messages.textContent = 'No match found. Please sign up if you do not have an account.'
+          stopCamera()
+        }
+      })
+      // camera will be started when user clicks Sign Up or Login
+    </script>
+  </body>
+</html>

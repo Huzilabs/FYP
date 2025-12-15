@@ -1,0 +1,17 @@
+# Ignore environment and secrets
+.env
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Ignore images and large data
+data/images/
+data/*.jpg
+data/*.jpeg
+data/*.png
+data/faces.pkl
+
+# OS files
+.DS_Store
+Thumbs.db

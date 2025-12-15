@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Welcome</title>
+    <style>
+      body { font-family: Arial, sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
+      .card { text-align:center; padding:24px; border:1px solid #eee; border-radius:8px; box-shadow: 0 6px 18px rgba(0,0,0,0.08); }
+      h1 { margin:0 0 8px 0 }
+      p { margin:0 }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Welcome</h1>
+      <p id="welcome-text">Hello —</p>
+      <p><a href="/">Back to login</a></p>
+    </div>
+
+    <script>
+      // Read ?name= query param
+      const params = new URLSearchParams(window.location.search)
+      const name = params.get('name') || 'friend'
+      document.getElementById('welcome-text').textContent = `Hello, ${name}! You are logged in.`
+    </script>
+  </body>
+</html>
