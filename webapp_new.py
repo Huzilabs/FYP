@@ -84,6 +84,32 @@ def coerce_bool(value: Optional[str]) -> bool:
 	return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
+def _get_actor_user_id():
+	"""Resolve caller identity for owner-only checks.
+
+	This accepts either header `X-User-Id` or form/json field `actor_user_id`.
+	It's a minimal protection mechanism intended for local/dev usage until
+	proper authentication is added (JWT / API key / Supabase auth).
+	"""
+	# Prefer header
+	try:
+		uid = request.headers.get('X-User-Id')
+		if uid:
+			return uid
+	except Exception:
+		pass
+	# Fall back to body param
+	try:
+		payload = request.get_json(silent=True) if request.is_json else request.form.to_dict()
+		if payload:
+			uid = payload.get('actor_user_id') or payload.get('user_id')
+			if uid:
+				return uid
+	except Exception:
+		pass
+	return None
+
+
 def get_db_conn():
 	if not SUPABASE_DB_URL:
 		raise RuntimeError('SUPABASE_DB_URL not set')
@@ -848,6 +874,248 @@ def api_admin_embeddings():
 		return jsonify({'ok': True, 'count': len(items), 'items': items}), 200
 	except Exception as exc:
 		app.logger.exception('admin/embeddings: db error')
+		try:
+			cur.close()
+		except Exception:
+			pass
+		try:
+			conn.close()
+		except Exception:
+			pass
+		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+@app.route('/api/users/<user_id>', methods=['GET'])
+def api_get_user(user_id):
+	"""Return user record, images and embedding metadata."""
+	# Only allow the owner (actor) to read this user's details
+	actor = _get_actor_user_id()
+	if not actor or str(actor) != str(user_id):
+		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+	try:
+		conn = get_db_conn()
+		cur = conn.cursor()
+		cur.execute("SELECT id, display_name, username, email, phone, date_of_birth, emergency_contact, medications, allergies, accessibility_needs, preferred_language, created_at FROM public.users WHERE id = %s", (user_id,))
+		row = cur.fetchone()
+		if not row:
+			cur.close()
+			conn.close()
+			return jsonify({'ok': False, 'error': 'user_missing'}), 404
+
+		user = {
+			'id': str(row[0]),
+			'display_name': row[1],
+			'username': row[2],
+			'email': row[3],
+			'phone': row[4],
+			'date_of_birth': row[5],
+			'emergency_contact': row[6],
+			'medications': row[7],
+			'allergies': row[8],
+			'accessibility_needs': row[9],
+			'preferred_language': row[10],
+			'created_at': row[11].isoformat() if getattr(row[11], 'isoformat', None) else str(row[11])
+		}
+
+		cur.execute("SELECT id, storage_path, public_url, is_profile, uploaded_at FROM public.user_images WHERE user_id = %s ORDER BY uploaded_at DESC", (user_id,))
+		images = []
+		for r in cur.fetchall():
+			images.append({'id': str(r[0]), 'storage_path': r[1], 'public_url': r[2], 'is_profile': bool(r[3]), 'uploaded_at': r[4].isoformat() if getattr(r[4], 'isoformat', None) else str(r[4])})
+
+		cur.execute("SELECT count(*) FROM public.embeddings WHERE user_id = %s", (user_id,))
+		emb_count = cur.fetchone()[0]
+
+		cur.close()
+		conn.close()
+		return jsonify({'ok': True, 'user': user, 'images': images, 'embedding_count': int(emb_count)}), 200
+	except Exception as exc:
+		app.logger.exception('get_user: db error')
+		try:
+			cur.close()
+		except Exception:
+			pass
+		try:
+			conn.close()
+		except Exception:
+			pass
+		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+@app.route('/api/users/<user_id>', methods=['PUT'])
+def api_update_user(user_id):
+	"""Update allowed user fields."""
+	payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+	allowed = ['display_name', 'email', 'phone', 'date_of_birth', 'emergency_contact', 'medications', 'allergies', 'accessibility_needs', 'preferred_language']
+	updates = {}
+	for k in allowed:
+		if k in payload:
+			updates[k] = payload.get(k)
+
+	if not updates:
+		return jsonify({'ok': False, 'error': 'no_updates'}), 400
+
+	# Owner-only: ensure caller is the same user
+	actor = _get_actor_user_id()
+	if not actor or str(actor) != str(user_id):
+		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+	try:
+		conn = get_db_conn()
+		cur = conn.cursor()
+		try:
+			try:
+				from psycopg2.extras import Json
+			except Exception:
+				Json = lambda x: json.dumps(x) if x is not None else None
+
+			set_clauses = []
+			params = []
+			for k, v in updates.items():
+				if k in ('emergency_contact', 'medications'):
+					set_clauses.append(f"{k} = %s")
+					params.append(Json(v) if v is not None else None)
+				else:
+					set_clauses.append(f"{k} = %s")
+					params.append(v)
+
+			params.append(user_id)
+			sql = f"UPDATE public.users SET {', '.join(set_clauses)} WHERE id = %s RETURNING id"
+			cur.execute(sql, tuple(params))
+			if not cur.fetchone():
+				conn.rollback()
+				cur.close()
+				conn.close()
+				return jsonify({'ok': False, 'error': 'user_missing'}), 404
+			conn.commit()
+		except Exception as exc:
+			conn.rollback()
+			app.logger.exception('update_user: db error')
+			cur.close()
+			conn.close()
+			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+		cur.close()
+		conn.close()
+		return jsonify({'ok': True}), 200
+	except Exception as exc:
+		app.logger.exception('update_user: unexpected')
+		try:
+			cur.close()
+		except Exception:
+			pass
+		try:
+			conn.close()
+		except Exception:
+			pass
+		return jsonify({'ok': False, 'error': 'unexpected', 'detail': str(exc)}), 500
+
+
+@app.route('/api/users/<user_id>', methods=['DELETE'])
+def api_delete_user(user_id):
+	"""Delete user and related DB rows. Attempts to remove storage files if configured.
+	Returns list of removed storage paths (DB rows) so client can confirm storage cleanup.
+	"""
+	# Owner-only: ensure caller is the same user
+	actor = _get_actor_user_id()
+	if not actor or str(actor) != str(user_id):
+		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+	try:
+		conn = get_db_conn()
+		cur = conn.cursor()
+		# collect user image paths
+		cur.execute("SELECT storage_path FROM public.user_images WHERE user_id = %s", (user_id,))
+		paths = [r[0] for r in cur.fetchall() if r[0]]
+
+		# delete embeddings, images, then user
+		cur.execute("DELETE FROM public.embeddings WHERE user_id = %s", (user_id,))
+		cur.execute("DELETE FROM public.user_images WHERE user_id = %s", (user_id,))
+		cur.execute("DELETE FROM public.users WHERE id = %s RETURNING id", (user_id,))
+		res = cur.fetchone()
+		if not res:
+			conn.rollback()
+			cur.close()
+			conn.close()
+			return jsonify({'ok': False, 'error': 'user_missing'}), 404
+		conn.commit()
+		cur.close()
+		conn.close()
+
+		removed_paths = []
+		if sb and SUPABASE_BUCKET and paths:
+			try:
+				for p in paths:
+					try:
+						# supabase storage client may accept list or single path depending on SDK
+						sb.storage.from_(SUPABASE_BUCKET).remove([p])
+						removed_paths.append(p)
+					except Exception:
+						app.logger.exception('failed to remove storage path: %s', p)
+			except Exception:
+				app.logger.exception('storage removal error')
+
+		return jsonify({'ok': True, 'removed_storage_paths': removed_paths}), 200
+	except Exception as exc:
+		app.logger.exception('delete_user: db error')
+		try:
+			cur.close()
+		except Exception:
+			pass
+		try:
+			conn.close()
+		except Exception:
+			pass
+		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+@app.route('/api/user_images/<image_id>', methods=['DELETE'])
+def api_delete_image(image_id):
+	"""Delete a single user_images row and attempt storage removal."""
+	# Owner-only: only the owner of the image may delete it. We verify by
+	# checking the image row's user_id against the caller identity.
+	actor = _get_actor_user_id()
+	if not actor:
+		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'missing actor identity'}), 403
+
+	try:
+		conn = get_db_conn()
+		cur = conn.cursor()
+		cur.execute("SELECT storage_path FROM public.user_images WHERE id = %s", (image_id,))
+		row = cur.fetchone()
+		if not row:
+			cur.close()
+			conn.close()
+			return jsonify({'ok': False, 'error': 'image_missing'}), 404
+		path = row[0]
+		# verify ownership
+		cur.execute("SELECT user_id FROM public.user_images WHERE id = %s", (image_id,))
+		owner_row = cur.fetchone()
+		if not owner_row or str(owner_row[0]) != str(actor):
+			cur.close()
+			conn.close()
+			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'not image owner'}), 403
+		cur.execute("DELETE FROM public.user_images WHERE id = %s RETURNING id", (image_id,))
+		res = cur.fetchone()
+		if not res:
+			conn.rollback()
+			cur.close()
+			conn.close()
+			return jsonify({'ok': False, 'error': 'delete_failed'}), 500
+		conn.commit()
+		cur.close()
+		conn.close()
+
+		removed = False
+		if sb and SUPABASE_BUCKET and path:
+			try:
+				sb.storage.from_(SUPABASE_BUCKET).remove([path])
+				removed = True
+			except Exception:
+				app.logger.exception('delete_image: storage remove failed for %s', path)
+
+		return jsonify({'ok': True, 'removed_from_storage': removed, 'storage_path': path}), 200
+	except Exception as exc:
+		app.logger.exception('delete_image: db error')
 		try:
 			cur.close()
 		except Exception:
