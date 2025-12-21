@@ -219,47 +219,41 @@ def compute_face_encoding(img_arr):
 	# Log image details for debugging
 	app.logger.debug('face detection: image shape %s, dtype %s', img_arr.shape, img_arr.dtype)
 	print(f'compute_face_encoding: image shape={getattr(img_arr, "shape", None)}', flush=True)
-	# Compute face locations first (handle different API versions)
+	# Fast path: prefer the lightweight `hog` detector with minimal upsampling
+	# and low jitter for encoding. If hog finds no faces, fall back to cnn.
 	locations = []
 	try:
-		# prefer 'cnn' if available for better accuracy
-		locations = face_recognition.face_locations(img_arr, model='cnn', number_of_times_to_upsample=2)
-	except TypeError:
-		try:
-			locations = face_recognition.face_locations(img_arr, model='cnn')
-		except Exception:
-			try:
-				locations = face_recognition.face_locations(img_arr)
-			except Exception:
-				locations = []
+		locations = face_recognition.face_locations(img_arr, model='hog', number_of_times_to_upsample=0)
 	except Exception:
 		try:
 			locations = face_recognition.face_locations(img_arr)
 		except Exception:
 			locations = []
 
-	app.logger.debug('face detection: found %d locations', len(locations))
+	app.logger.debug('face detection (fast/hog) found %d locations', len(locations))
+
+	# If no faces found with hog, try cnn once with a small upsample for accuracy
+	if not locations:
+		try:
+			locations = face_recognition.face_locations(img_arr, model='cnn', number_of_times_to_upsample=1)
+		except Exception:
+			try:
+				locations = face_recognition.face_locations(img_arr)
+			except Exception:
+				locations = []
+
+	app.logger.debug('face detection: final locations count %d', len(locations))
 	if not locations:
 		return None
 
-	# Now compute encodings for those locations. Different face_recognition
-	# versions accept different kwargs; prefer using named param
-	# `known_face_locations` and avoid `num_upsamples` which some builds
-	# do not accept. Try a few combinations to be robust.
+	# Compute encodings with minimal jitter to speed up processing.
 	encodings = []
 	try:
-		# Preferred: pass known locations and use more jitter/model for accuracy
-		encodings = face_recognition.face_encodings(img_arr, known_face_locations=locations, num_jitters=5, model='large')
+		# Many builds accept `known_face_locations` and `num_jitters`; use low jitter (1)
+		encodings = face_recognition.face_encodings(img_arr, known_face_locations=locations, num_jitters=1)
 	except TypeError:
 		try:
-			# Older versions may not accept `model`, try without it
-			encodings = face_recognition.face_encodings(img_arr, known_face_locations=locations, num_jitters=5)
-		except TypeError:
-			try:
-				# Very old versions may only accept positional known locations
-				encodings = face_recognition.face_encodings(img_arr, locations)
-			except Exception:
-				encodings = []
+			encodings = face_recognition.face_encodings(img_arr, locations)
 		except Exception:
 			encodings = []
 	except Exception:
