@@ -1,382 +1,127 @@
-# Face Auth API — Frontend Integration Guide
-
-Quick reference for the capture-first face-auth Flask backend. Use these endpoints from the frontend to detect faces, register users, attach images, and perform face login.
-
-Environment required (server side):
-
-- `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_URL`/`DATABASE_URL`, `SUPABASE_BUCKET` (storage)
-- PostgreSQL with `pgvector` recommended for nearest-neighbour login; fallback to float8[] insert works but nearest lookup requires pgvector.
-
-Endpoints
-
-- **POST /api/detect_face**
-
-  - Payload: JSON { `face_image`: data-url string } or form field `image`.
-  - Response: 200 OK { `ok`: true, `faces`: [{top,right,bottom,left}, ...] } or 400/500 on error.
-  - Use: show bounding boxes on the client before submitting image.
-
-- **POST /api/upload_face_temp**
-
-  - Payload: JSON { `face_image`: data-url }.
-  - Response: 200 { `ok`: true, `temp_storage_path`, `public_url`, `preview_data_url` }.
-  - Use: optional temp upload flow for preview-before-register.
-
-- **POST /api/capture_face**
-
-  - Payload: JSON { `face_image`: data-url, optional `user_id` }.
-  - Behavior: If `user_id` missing, creates a provisional user, uploads image to storage, inserts `user_images` and an embedding (separate DB transaction) and returns profile image URL.
-  - Response: 201 { `ok`: true, `profile_image_url`, `storage_path`, `preview_data_url` } or { `ok`: false, `error`: ... }.
-
-- **POST /signup** (alias for `/api/register`) or **POST /api/register**
-
-  - Payload: JSON with required fields: `display_name`, `username`, `consent_terms` (true). Optional: `image` (data-url) or `temp_storage_path`.
-  - Behavior: creates/updates the user, optionally attaches image and inserts embedding. Will not rollback user on embedding failures.
-  - Response: 201 { `ok`: true, `user_id`, `display_name` }.
-
-- **POST /api/attach_image**
-
-  - Payload: JSON { `user_id`, `face_image`: data-url } or `temp_storage_path`.
-  - Behavior: inserts `user_images` (own transaction) and attempts to compute embedding and insert it separately.
-  - Response: 201 { `ok`: true, `storage_path`, `public_url` }.
-
-- **POST /api/login_face**
-
-  - Payload: JSON { `face_image`: data-url, optional `threshold` (default 0.5), `limit` (default 1) }.
-  - Behavior: computes encoding, calls DB nearest-neighbour helper `public.find_nearest_embeddings` (requires pgvector), applies threshold in server.
-  - Responses:
-    - 200 { `ok`: true, `user`: {id, display_name, username}, `distance` } on successful match
-    - 200 { `ok`: false, `error`: 'no_match' } when no close embedding
-    - 501 if pgvector / nearest lookup not available.
-
-- **GET /api/admin/embeddings** (dev helper)
-  - Query params: `user_id` required.
-  - Response: 200 { `ok`: true, `count`, `items` }.
-
-Client notes
-
-- Always call `/api/detect_face` first to show bounding boxes and confirm a single face is present.
-- For quick preview flows, use `/api/upload_face_temp` and show `preview_data_url` while uploading.
-- For capture-first UX: call `/api/capture_face` with the data-url; the server will create a provisional user if needed.
-- If login fails, increase `threshold` to allow looser matches (not recommended for production).
-
-Examples (curl)
-
-Detect:
-
-```
-curl -X POST http://localhost:5000/api/detect_face -H "Content-Type: application/json" \
-  -d '{"face_image": "data:image/jpeg;base64,..."}'
-```
-
-Signup (with image data-url):
-
-```
-curl -X POST http://localhost:5000/signup -H "Content-Type: application/json" \
-  -d '{"display_name":"Alice","username":"alice1","consent_terms":true,"image":"data:image/jpeg;base64,..."}'
-```
-
-Login by face:
-
-```
-curl -X POST http://localhost:5000/api/login_face -H "Content-Type: application/json" \
-  -d '{"face_image":"data:image/jpeg;base64,...","threshold":0.6}'
-```
-
-Security & deployment notes
-
-- This app runs as a development Flask server by default. Use a production WSGI server (gunicorn/uvicorn) behind TLS.
-- Keep Supabase service role key secret. Do not expose it to clients.
-- For nearest-neighbour login, enable `pgvector` in Postgres and create the DB helper `public.find_nearest_embeddings` as in the migrations.
-
-Storage details (Supabase)
-
-- Objects are stored by key (path). The app uploads bytes to Supabase Storage with a `path` such as `user_id/profile.jpg` or `temp/<uuid>.jpg`.
-- Folders are virtual: there is no separate "create folder" step — a path prefix like `user_id/` is just part of the object key and appears as a folder in the dashboard UI.
-- Public vs signed URLs: the backend first calls `get_public_url(path)` to return a stable public URL when the bucket is public. If the bucket is private, the backend falls back to `create_signed_url(path, ttl)` to generate a signed URL for client access.
-- Overwrite behavior: uploading to the same path (same `user_id/profile.jpg`) will replace the object at that key. If you want to keep history, use unique filenames (timestamp + uuid). To avoid creating many files per user, use a stable filename like `profile.jpg` for profile images.
-- Path conventions used by the app:
-  - Temp uploads: `temp/<uuid>.jpg`
-  - Per-user profile images: `<user_id>/<filename>` (by default the code uses timestamp+uuid; change to `profile.jpg` to overwrite)
-- Uploads performed by endpoints: `/api/upload_face_temp`, `/api/capture_face`, `/api/register` (when `image` or `temp_storage_path` present), and `/api/attach_image` — these endpoints call the storage upload helper and persist URLs to `user_images` in the DB.
-- `/api/login_face` does not store images by default; it only computes an encoding from the submitted image and performs a nearest-neighbour lookup. If you want to persist login images, add a `save_image_to_storage` call in that endpoint.
-
-If you want, I can produce a shorter API spec (OpenAPI/Swagger) or example React code for the capture UI.
-
----
-
-Generated by the repo maintainer script.
-
-# FaceAuth — simple local face registration & login
-
-This repository contains a minimal, local face-recognition flow implemented with Flask.
-It lets a user register by capturing a webcam frame (saved locally) and then login by matching live frames against stored embeddings.
-
-Contents included in this branch:
-
-- `webapp.py` — Flask server providing `/` (UI), `/signup` and `/login` endpoints.
-- `templates/index.html`, `templates/welcome.html` — UI pages (webcam UI, signup form, login flow).
-- `requirements.txt` — minimal Python packages used.
-- `tools/create_pickles_and_test.py` — helper to create pickles from images and test recognition (optional).
-- `tests/headless_test.py` — headless test helper (optional).
-
-Not included
-
-- `data/images/` (image files) are ignored to avoid committing photos.
-- `.env` (contains keys) is not included. Supabase-related files (e.g. `db_supabase.py`) are present in the repo but not used by the local Flask UI by default.
-
-How this project stores data
-
-- By default the Flask app stores registered user names in `data/names.pkl` and face embeddings in `data/faces_data.pkl`. Captured images are written to `data/images/<name>/`.
-- The current local UI does NOT require any remote DB; Supabase helper code exists in the repo but is not used by the UI unless you wire it up and provide credentials.
-
-Quick start (Windows / PowerShell)
-
-1. Create / activate conda env and install dependencies (or use your existing env with dlib/face_recognition installed):
-
-```powershell
-conda create -n face-recognition-project python=3.8 -y
-conda activate face-recognition-project
-# install heavy libs via conda-forge if needed (dlib/face_recognition)
-conda install -n face-recognition-project -c conda-forge dlib face_recognition opencv pillow cmake -y
-pip install -r "C:\Users\uses\Downloads\face recognition\requirements.txt"
-```
-
-2. Run the app (foreground, so you can see logs):
-
-```powershell
-conda activate face-recognition-project
-python -u "C:\Users\uses\Downloads\face recognition\webapp.py"
-# Open http://127.0.0.1:5000 in your browser
-```
-
-3. Use the UI:
-
-- Click "Sign Up" → enter a name → click Register (the UI will start the camera and capture frames).
-- Click "Login (5s)" → the UI will capture frames for up to 5s and redirect to a welcome page on success.
-
-Security notes
-
-- This is a demo/local prototype. Do not expose it publicly without adding authentication, HTTPS, and anti-spoofing/liveness checks.
-
-If you want me to push the code to your GitHub repo or adjust which files are included, tell me and I will push to a branch (default: `feature/faceauth`).
-
-# Face Recognition Attendance System with Supabase# face_recognition_project
+# Face Recognition Flask API
 
 ## Overview
 
-This is a face recognition attendance system that uses dlib/face_recognition for embeddings (128-d vectors) and Supabase as the backend database instead of Firebase.
+This repository provides a small Flask server (webapp_new.py) that implements a "capture-first" face authentication flow using Supabase Storage for images and PostgreSQL for user and embedding storage. The server uses the face_recognition library for face detection and 128-d embeddings.
 
-## Face Recognition Model Used
+Environment variables (required)
 
-- **Model**: dlib's ResNet-based face recognition model
-- **Embedding**: 128-dimensional face encodings
-- **Detection**: HOG (Histogram of Oriented Gradients) by default
-- **Matching**: Euclidean distance between embeddings
+- SUPABASE_URL — your Supabase project URL
+- SUPABASE_SERVICE_ROLE_KEY — service role key used for storage and DB operations
+- SUPABASE_DB_URL or DATABASE_URL — Postgres connection string used by the server
+- SUPABASE_BUCKET — Supabase storage bucket name used for uploading images
 
-## Prerequisites
+Important behavior notes
 
-- Python 3.8+
-- Conda environment (recommended for dlib on Windows)
-- Supabase account and project
+- Storage: images are uploaded to the configured Supabase bucket. The server first tries to use the bucket's public URL and falls back to creating a signed URL if the bucket/object is private. Signed URLs are created with a long expiry (one year) for convenience.
+- Embeddings: the server will insert 128-d embeddings into `public.embeddings`. It tries to insert as a PostgreSQL `float8[]` first (works without pgvector). If the DB has the `vector` type available (pgvector), the server may use a `::vector` cast and DB helper functions for nearest-neighbor lookups.
+- Face detection: the service prefers the lightweight `hog` detector for speed and falls back to `cnn` when necessary.
 
-## Installation
+## HTTP API (summary)
 
-### 1. Create Conda Environment
+All endpoints are under `/api/` except the legacy `/signup` form endpoint.
 
-```bash
-conda create -n face-recognition python=3.8 -y
-conda activate face-recognition
-```
+- `POST /api/detect_face`
 
-### 2. Install Dependencies
+  - Body: JSON or form data with `face_image` (data URL) or `image` (data URL).
+  - Returns: `{ok: true, faces: [{top,right,bottom,left}, ...]}` or `{ok:false}` on error.
 
-```bash
-# Install face recognition stack (Windows)
-conda install -c conda-forge dlib face_recognition opencv numpy -y
+- `POST /api/upload_face_temp` (and legacy alias `/api/upload_face`)
 
-# Install other dependencies
-pip install supabase python-dotenv cvzone pillow
-```
+  - Purpose: upload a temporary image to storage for preview before registering.
+  - Body: `face_image` (data URL) or `image` (data URL).
+  - Returns: `{ok:true, temp_storage_path, public_url, preview_data_url}`. `preview_data_url` is a base64 data URL suitable for immediate client preview.
 
-### 3. Supabase Setup
+- `POST /api/capture_face`
 
-#### Create Tables in Supabase SQL Editor:
+  - Purpose: capture a face image and attach it to a user; supports capture-first flow.
+  - Body: `face_image` or `image` (data URL). Optional `user_id` to attach to an existing user.
+  - Behavior: if `user_id` is omitted, a provisional user record is created, then the image is saved to storage, a `user_images` row is inserted, and an embedding is inserted into `public.embeddings`.
+  - Returns: `{ok:true, profile_image_url, storage_path, preview_data_url}` on success.
 
-```sql
--- Users table
-CREATE TABLE users (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  major TEXT,
-  starting_year INTEGER,
-  total_attendance INTEGER DEFAULT 0,
-  standing TEXT,
-  year INTEGER,
-  last_attendance_time TEXT,
-  created_at TIMESTAMP DEFAULT NOW()
-);
+- `POST /api/register` (also `/signup` form POST)
 
--- Embeddings table
-CREATE TABLE embeddings (
-  id SERIAL PRIMARY KEY,
-  user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
-  embedding JSONB NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
-);
+  - Purpose: create or update a user. This endpoint uses `ON CONFLICT (username) DO UPDATE` so POSTing the same `username` updates the existing record.
+  - Required fields (must provide these to create):
+    - `display_name` (string) — full name or display name
+    - `username` (string) — unique username
+    - `consent_terms` (boolean or truthy string) — must be true to register
+  - Optional fields accepted:
+    - `email`, `phone`
+    - `date_of_birth` (string)
+    - `emergency_contact` (JSON string or form-encoded string)
+    - `medications` (JSON array string or comma-separated list)
+    - `allergies` (comma-separated string or array)
+    - `accessibility_needs`, `preferred_language`
+    - `image` or `face_image` (data URL) — an image to attach and create embedding
+    - `temp_storage_path` or `temp_path` — a path previously returned by `/api/upload_face_temp`
+  - Behavior: user row is created/updated in one transaction. If an image is supplied, it is processed in a separate transaction/flow so user creation will not be rolled back because of image/embedding errors.
+  - Returns: `{ok:true, user_id, display_name}` on success.
 
--- Attendance log table
-CREATE TABLE attendance_log (
-  id SERIAL PRIMARY KEY,
-  user_id TEXT REFERENCES users(id),
-  timestamp TIMESTAMP DEFAULT NOW(),
-  method TEXT,
-  confidence REAL
-);
+- `POST /api/attach_image`
 
--- Create indexes
-CREATE INDEX idx_embeddings_user_id ON embeddings(user_id);
-CREATE INDEX idx_attendance_user_id ON attendance_log(user_id);
-CREATE INDEX idx_attendance_timestamp ON attendance_log(timestamp);
-```
+  - Purpose: attach an image to an existing user.
+  - Body: `user_id` (required) and either `face_image` (data URL) or `temp_storage_path`.
+  - Behavior: inserts a `user_images` row in its own transaction (won't roll back user creation). Attempts to compute an embedding and insert it separately; embedding failures do not roll back the image insert.
+  - Returns: `{ok:true, storage_path, public_url}` on success.
 
-#### Create Storage Bucket:
+- `POST /api/login_face`
 
-1. Go to Supabase Dashboard → Storage
-2. Create a new bucket named `images`
-3. Make it public or configure policies as needed
+  - Purpose: attempt a face login using nearest-neighbour search against stored embeddings.
+  - Body: `face_image` (data URL) or `image` (data URL). Optional `threshold` (float, default 0.5) and `limit` (int, default 1).
+  - Important: nearest-neighbor lookup requires pgvector / `vector` type and a DB helper `public.find_nearest_embeddings`. If your Postgres does not have pgvector installed, the endpoint will return a helpful error `{error: 'nearest_embeddings_not_supported'}` with status 501. The server supports float8[] storage of embeddings, but efficient nearest lookups require pgvector.
+  - On success: returns `{ok:true, user: {id, display_name, username}, distance}` where `distance` is the L2 distance (lower is closer). If no match within the provided `threshold`, the endpoint returns a no-match response.
 
-### 4. Configure Environment
+  - Purpose: debug helper to list embedding metadata for a user. Intended for local testing only (not secured).
 
-Create `.env` file:
+## Owner-only CRUD behavior
 
-```
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your-anon-or-service-role-key
-```
-
-## Project Structure
-
-```
-face recognition/
-├── .env                    # Supabase credentials
-├── db_supabase.py         # Supabase helper functions
-├── AddDataToDatabase.py   # Add sample users
-├── EncodeGenerator.py     # Generate embeddings
-├── Main.py                # Face recognition system
-├── Images/                # User images (userid.png)
-├── Resources/             # UI resources (optional)
-│   ├── background.png
-│   └── Modes/
-└── README.md
-```
-
-## Usage
-
-### Step 1: Add Users to Database
+  - Preferred: set HTTP header `X-User-Id: <user_id>` on the request.
+  - Alternative: include `actor_user_id` (or `user_id`) in the JSON body or form data.
+  - `GET /api/users/<user_id>` — returns user details only if actor matches `user_id`.
+  - `PUT /api/users/<user_id>` — updates user fields only if actor matches `user_id`.
+  - `DELETE /api/users/<user_id>` — deletes user and related data only if actor matches `user_id`.
+  - `DELETE /api/user_images/<image_id>` — deletes image only if the actor is the owner of that image.
 
 ```bash
-python AddDataToDatabase.py
+curl -H "Content-Type: application/json" -H "X-User-Id: <USER_ID>" \
+  -d '{"display_name":"New Name"}' \
+  -X PUT https://your-host/api/users/<USER_ID>
 ```
 
-### Step 2: Add User Images
+Security note: this header-based check is a minimal convenience for local or trusted frontends. For production, replace with proper authentication (JWT, Supabase auth, or API keys) and validate tokens server-side before authorizing CRUD operations.
 
-- Create `Images/` folder
-- Add user photos named as `<user_id>.png`
-- Example: `321654.png`, `852741.png`
 
-### Step 3: Generate Embeddings
+## Data model & CRUD notes
+
+- Users:
+
+  - Create / Update: `POST /api/register` with `username` will create or update the user. The endpoint returns the user `id`.
+  - Read: no specific HTTP read endpoint is provided beyond what `login_face` returns; you can query the DB directly or add a read endpoint if needed.
+  - Delete: there is no HTTP delete-user endpoint in the current server. Deleting a user must be done directly in the database or by adding an API endpoint.
+
+- Images (`public.user_images`):
+  - Add: use `/api/capture_face`, `/api/attach_image`, or `/api/register` (with `image`) to insert new images. Uploaded image files are stored at keys like `user_id/<timestamp>_<uuid>.jpg` or `temp/<uuid>.jpg` for temporary uploads.
+  - Update (set profile image): image uploads mark `is_profile = true` for the inserted row. The server currently writes new files with unique filenames — it does not overwrite previous files by default. If you prefer overwrite behavior (e.g., always use `profile.jpg`), request the change and we can update the upload logic.
+  - Delete: there is no HTTP delete-image endpoint; deletion must be done in the DB and storage manually or by adding an endpoint.
+
+## Embedding storage & nearest-neighbor
+
+- Insert strategy: the server first tries to insert embeddings as `float8[]` so the app works without pgvector. If pgvector is available, the code can use a `::vector` cast and DB helper functions for efficient nearest-neighbor queries.
+- For `login_face`, the server expects pgvector and a DB function like `public.find_nearest_embeddings(vector, limit)` to exist. If you want nearest lookups without pgvector, you must add custom SQL or a server-side fallback (not included by default).
+
+## Storage URLs
+
+- The server calls Supabase Storage `get_public_url` and, if that doesn't return a usable public URL, calls `create_signed_url` to produce a usable URL. If both fail the server may still return the storage path so the client can handle retrieval.
+
+## Running locally
+
+1. Ensure the environment variables above are set.
+2. Install dependencies listed in `requirements.txt` (creates a Python environment with Flask, face_recognition, Pillow, numpy, psycopg2, supabase client, etc.).
+3. Run the server:
 
 ```bash
-python EncodeGenerator.py
+python webapp_new.py
 ```
 
-### Step 4: Run Face Recognition
-
-```bash
-python Main.py
-```
-
-Press 'q' to quit.
-
-## Code Files
-
-All code files are provided in the sections below. Copy each section into the respective file.
-
----
-
-## Comparison: Firebase vs Supabase
-
-### What Changed:
-
-1. **Database**: Firebase Realtime Database → Supabase Postgres
-2. **Storage**: Firebase Storage → Supabase Storage
-3. **Authentication**: firebase-admin SDK → supabase-py client
-4. **Data Format**: Embeddings stored as JSONB arrays in Postgres
-
-### What Stayed The Same:
-
-- Face recognition model (dlib 128-d embeddings)
-- Detection and matching logic
-- UI and display flow
-- Attendance tracking logic
-
-### Model Details:
-
-The Firebase code you shared uses `face_recognition.face_encodings()` which:
-
-- Uses dlib's pretrained ResNet model
-- Produces 128-dimensional embeddings
-- Compares faces using Euclidean distance
-- Threshold typically 0.6 (closer to 0 = better match)
-
-This is the industry-standard approach and is what we're keeping in the Supabase version.
-
-## Next Steps
-
-1. **Test locally** with SQLite first (optional):
-   - I can provide SQLite version if you want offline-first testing
-2. **Mobile integration**:
-
-   - Convert embeddings computation to TFLite
-   - Use Supabase client on mobile (React Native, Flutter, etc.)
-
-3. **Add liveness detection** for spoofing prevention
-
-4. **Accessibility features** for elderly users:
-   - Voice prompts
-   - Large UI elements
-   - Caregiver notifications
-
-## Troubleshooting
-
-### "No module named 'dlib'"
-
-- Use conda: `conda install -c conda-forge dlib`
-
-### "SUPABASE_URL not found"
-
-- Check .env file exists and is in the same directory
-- Verify .env format (no quotes needed)
-
-### "No encodings found"
-
-- Run `EncodeGenerator.py` first
-- Check that Images/ folder has .png files
-- Verify face is clearly visible in images
-
-### "User not found in database"
-
-- Run `AddDataToDatabase.py` first
-- Or manually add users via Supabase dashboard
-
-## Support
-
-For issues:
-
-1. Check Supabase dashboard logs
-2. Verify table structure matches SQL above
-3. Test connection: `python db_supabase.py`
-
-## License
-
-Educational/Personal Use
+\*\*\* End Patch
