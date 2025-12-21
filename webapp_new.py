@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 import logging
 import sys
 import json
+import numpy as np
 
 load_dotenv()
 SUPABASE_URL = os.getenv('SUPABASE_URL')
@@ -134,14 +135,12 @@ def normalize_public_url(pu) -> str:
 	return str(pu)
 
 
-def decode_base64_image(data_url: str) -> Tuple['numpy.ndarray', bytes]:
+def decode_base64_image(data_url: str) -> Tuple[np.ndarray, bytes]:
 	if ',' not in data_url:
 		raise ValueError('invalid data URL')
 	_, b64 = data_url.split(',', 1)
 	img_bytes = base64.b64decode(b64)
 	img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-	import numpy as np
-
 	arr = np.array(img)
 	return arr, img_bytes
 
