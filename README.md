@@ -88,6 +88,18 @@ Security & deployment notes
 - Keep Supabase service role key secret. Do not expose it to clients.
 - For nearest-neighbour login, enable `pgvector` in Postgres and create the DB helper `public.find_nearest_embeddings` as in the migrations.
 
+Storage details (Supabase)
+
+- Objects are stored by key (path). The app uploads bytes to Supabase Storage with a `path` such as `user_id/profile.jpg` or `temp/<uuid>.jpg`.
+- Folders are virtual: there is no separate "create folder" step — a path prefix like `user_id/` is just part of the object key and appears as a folder in the dashboard UI.
+- Public vs signed URLs: the backend first calls `get_public_url(path)` to return a stable public URL when the bucket is public. If the bucket is private, the backend falls back to `create_signed_url(path, ttl)` to generate a signed URL for client access.
+- Overwrite behavior: uploading to the same path (same `user_id/profile.jpg`) will replace the object at that key. If you want to keep history, use unique filenames (timestamp + uuid). To avoid creating many files per user, use a stable filename like `profile.jpg` for profile images.
+- Path conventions used by the app:
+  - Temp uploads: `temp/<uuid>.jpg`
+  - Per-user profile images: `<user_id>/<filename>` (by default the code uses timestamp+uuid; change to `profile.jpg` to overwrite)
+- Uploads performed by endpoints: `/api/upload_face_temp`, `/api/capture_face`, `/api/register` (when `image` or `temp_storage_path` present), and `/api/attach_image` — these endpoints call the storage upload helper and persist URLs to `user_images` in the DB.
+- `/api/login_face` does not store images by default; it only computes an encoding from the submitted image and performs a nearest-neighbour lookup. If you want to persist login images, add a `save_image_to_storage` call in that endpoint.
+
 If you want, I can produce a shorter API spec (OpenAPI/Swagger) or example React code for the capture UI.
 
 ---
