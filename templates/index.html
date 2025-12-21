@@ -33,9 +33,13 @@
       </header>
 
       <div class="app">
-        <div class="camera-area">
-          <video id="video" class="hidden" autoplay playsinline muted></video>
+        <div class="camera-area" style="position:relative">
+          <video id="video" class="hidden" autoplay playsinline muted style="display:block"></video>
+          <canvas id="overlay" style="position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; display:none"></canvas>
+          <div id="no-face-indicator" style="position:absolute; left:50%; top:10px; transform:translateX(-50%); background:rgba(220,38,38,0.9); color:#fff; padding:6px 10px; border-radius:6px; font-weight:600; display:none; pointer-events:none; z-index:30">No face detected</div>
           <div id="status" class="status hidden">Camera not started</div>
+          <div id="center-guide" style="position:absolute; left:50%; top:50%; width:200px; height:200px; margin-left:-100px; margin-top:-100px; border:2px dashed rgba(255,255,255,0.9); box-shadow:0 0 0 3px rgba(0,0,0,0.25); border-radius:6px; pointer-events:none; display:none"></div>
+          <button id="capture-btn" style="position:absolute; left:50%; transform:translateX(-50%); bottom:12px; display:none; padding:10px 14px; border-radius:6px; background:var(--accent); color:#fff; border:none; cursor:pointer">Capture</button>
         </div>
 
         <div class="panel">
@@ -46,7 +50,45 @@
 
           <form id="signup-form" class="hidden">
             <label for="name-input">Full name</label>
-            <input id="name-input" type="text" placeholder="e.g. Alice" />
+            <input id="name-input" name="name" type="text" placeholder="e.g. Alice" />
+
+            <label for="username-input">Username (unique)</label>
+            <input id="username-input" name="username" type="text" placeholder="e.g. alice_01" />
+
+            <label for="email-input">Email</label>
+            <input id="email-input" name="email" type="text" placeholder="you@example.com" />
+
+            <label for="phone-input">Phone</label>
+            <input id="phone-input" name="phone" type="text" placeholder="+44 7000 000000" />
+
+            <label for="dob-input">Date of birth</label>
+            <input id="dob-input" name="date_of_birth" type="text" placeholder="YYYY-MM-DD" />
+
+            <label for="emergency-name">Emergency contact name</label>
+            <input id="emergency-name" name="emergency_name" type="text" placeholder="Carer name" />
+            <label for="emergency-phone">Emergency contact phone</label>
+            <input id="emergency-phone" name="emergency_phone" type="text" placeholder="+44 7000 000000" />
+            <label for="emergency-relation">Emergency contact relation</label>
+            <input id="emergency-relation" name="emergency_relation" type="text" placeholder="e.g. son/daughter/carer" />
+
+            <label for="medications-input">Medications (JSON or comma-separated)</label>
+            <textarea id="medications-input" name="medications" rows="3" style="width:100%" placeholder='[{"name":"Aspirin","dose":"100mg","schedule":"daily"}] or Aspirin,Paracetamol'></textarea>
+
+            <label for="allergies-input">Allergies (comma-separated)</label>
+            <input id="allergies-input" name="allergies" type="text" placeholder="peanuts,penicillin" />
+
+            <label for="accessibility-input">Accessibility needs</label>
+            <input id="accessibility-input" name="accessibility_needs" type="text" placeholder="e.g. large text, voice prompts" />
+
+            <label for="language-input">Preferred language</label>
+            <input id="language-input" name="preferred_language" type="text" placeholder="en" />
+
+            <label><input id="consent-checkbox" name="consent_terms" type="checkbox" /> I consent to storing my data for authentication</label>
+            <input type="hidden" id="temp-path" name="temp_storage_path" />
+            <div style="margin-top:8px">
+              <img id="preview-img" src="" alt="captured preview" style="max-width:200px; display:none; border:1px solid #ddd; border-radius:6px" />
+            </div>
+
             <div class="signup-actions">
               <button id="signup-cancel" type="button">Cancel</button>
               <button id="signup" type="button" class="primary">Register</button>
@@ -71,13 +113,15 @@
       async function startCamera(){
         if(_cameraStream) return // already started
         try{
-          const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+          const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false })
           _cameraStream = stream
           video.srcObject = stream
           await video.play()
           video.classList.remove('hidden')
           status.classList.remove('hidden')
-          status.textContent = 'Camera ready'
+          status.textContent = 'Camera ready — align your face inside the box and click Capture.'
+          document.getElementById('center-guide').style.display = 'block'
+          document.getElementById('capture-btn').style.display = 'block'
         }catch(e){
           status.classList.remove('hidden')
           status.textContent = 'Camera error: ' + e.message
@@ -97,11 +141,101 @@
 
       function captureFrame(){
         const canvas = document.createElement('canvas')
-        canvas.width = video.videoWidth || 640
-        canvas.height = video.videoHeight || 480
+        // crop to center square area to focus on face
+        const vw = video.videoWidth || 640
+        const vh = video.videoHeight || 480
+        const size = Math.min(vw, vh, 480)
+        canvas.width = size
+        canvas.height = size
         const ctx = canvas.getContext('2d')
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-        return canvas.toDataURL('image/jpeg', 0.8)
+        const sx = Math.max(0, (vw - size) / 2)
+        const sy = Math.max(0, (vh - size) / 2)
+        ctx.drawImage(video, sx, sy, size, size, 0, 0, size, size)
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.85)
+        // expose last capture size for overlay scaling
+        window._lastCaptureSize = size
+        window._lastCaptureDataUrl = dataUrl
+        return dataUrl
+      }
+
+      // Draw detection boxes on overlay canvas. Faces are [{top,right,bottom,left}]
+      function drawDetections(faces){
+        const overlay = document.getElementById('overlay')
+        const indicator = document.getElementById('no-face-indicator')
+        if(!window._lastCaptureSize){
+          overlay.style.display = 'none'
+          if(indicator) indicator.style.display = 'none'
+          return
+        }
+        const vw = video.clientWidth || video.offsetWidth
+        const vh = video.clientHeight || video.offsetHeight
+        // set canvas pixel size to displayed video size
+        overlay.width = vw
+        overlay.height = vh
+        overlay.style.display = 'block'
+        const ctx = overlay.getContext('2d')
+        ctx.clearRect(0,0,overlay.width, overlay.height)
+        if(!faces || faces.length === 0){
+          if(indicator) indicator.style.display = 'block'
+          // draw a clear message on the overlay as well
+          ctx.fillStyle = 'rgba(220,38,38,0.95)'
+          ctx.font = '20px Arial'
+          ctx.textAlign = 'center'
+          ctx.fillText('No face detected', overlay.width/2, overlay.height/2)
+          return
+        } else {
+          if(indicator) indicator.style.display = 'none'
+        }
+        const scaleX = vw / window._lastCaptureSize
+        const scaleY = vh / window._lastCaptureSize
+        ctx.lineWidth = 3
+        ctx.strokeStyle = 'rgba(37,99,235,0.95)'
+        ctx.fillStyle = 'rgba(37,99,235,0.9)'
+        ctx.font = '14px Arial'
+        faces.forEach((f, i)=>{
+          const x = f.left * scaleX
+          const y = f.top * scaleY
+          const w = (f.right - f.left) * scaleX
+          const h = (f.bottom - f.top) * scaleY
+          ctx.strokeRect(x, y, w, h)
+          const label = `face ${i+1}`
+          const textW = ctx.measureText(label).width + 8
+          ctx.fillRect(x, Math.max(0, y-20), textW, 20)
+          ctx.fillStyle = '#fff'
+          ctx.fillText(label, x+4, Math.max(12, y-6))
+          ctx.fillStyle = 'rgba(37,99,235,0.9)'
+        })
+      }
+
+      async function captureAndUpload(){
+        messages.textContent = 'Capturing image for registration preview...'
+        const dataUrl = captureFrame()
+        try{
+          const res = await postJSON('/api/upload_face', { face_image: dataUrl })
+          if(res.ok){
+            document.getElementById('temp-path').value = res.temp_storage_path
+            const prev = document.getElementById('preview-img')
+            // prefer preview_data_url from server, then public_url, then storage path
+            prev.src = res.preview_data_url || res.public_url || res.temp_storage_path
+            prev.style.display = 'block'
+            signupForm.classList.remove('hidden')
+            nameInput.focus()
+            messages.textContent = 'Preview captured — complete your details and Register.'
+            // hide capture UI
+            document.getElementById('center-guide').style.display = 'none'
+            document.getElementById('capture-btn').style.display = 'none'
+            // request server-side detection to draw boxes on overlay
+            try{
+              const dres = await postJSON('/api/detect_face', { face_image: dataUrl })
+              if(dres && Array.isArray(dres.faces)) drawDetections(dres.faces)
+              else drawDetections([])
+            }catch(e){ console.warn('detect_face failed', e); drawDetections([]) }
+          } else {
+            messages.textContent = 'Temp upload failed: ' + (res.detail||res.error)
+          }
+        }catch(e){
+          messages.textContent = 'Temp upload error: '+e.message
+        }
       }
 
       async function postForm(url, formData){
@@ -117,14 +251,41 @@
       const nameInput = document.getElementById('name-input')
       const messages = document.getElementById('messages')
 
+      // manual capture controls (only enabled for signup)
+      const captureBtn = document.getElementById('capture-btn')
+      let _manualCaptureAttached = false
+      function enableManualCapture(){
+        if(_manualCaptureAttached) return
+        captureBtn.addEventListener('click', captureAndUpload)
+        video.addEventListener('click', captureAndUpload)
+        _manualCaptureAttached = true
+      }
+      function disableManualCapture(){
+        if(!_manualCaptureAttached) return
+        try{ captureBtn.removeEventListener('click', captureAndUpload) }catch(e){}
+        try{ video.removeEventListener('click', captureAndUpload) }catch(e){}
+        _manualCaptureAttached = false
+      }
+
+      // Helper: post JSON
+      async function postJSON(url, obj){
+        const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(obj) })
+        return resp.json()
+      }
+
       showSignupBtn.addEventListener('click', async ()=>{
-        // start camera when user opens signup
+        // start camera and show capture UI; user will click Capture or video
         await startCamera()
-        signupForm.classList.remove('hidden')
-        nameInput.focus()
+        signupForm.classList.add('hidden')
+        messages.textContent = 'Align your face in the box then click Capture.'
+        // enable manual capture controls for signup
+        enableManualCapture()
       })
+
+      // manual capture listeners moved to signup flow (enableManualCapture / disableManualCapture)
       signupCancel.addEventListener('click', ()=>{
         signupForm.classList.add('hidden')
+        disableManualCapture()
         stopCamera()
       })
 
@@ -140,13 +301,30 @@
         let success = false
         for(let i=0;i<maxTries && !success;i++){
           const dataUrl = captureFrame()
+          // draw detection boxes for user feedback
+          try{
+            const dres = await postJSON('/api/detect_face', { face_image: dataUrl })
+            if(dres && Array.isArray(dres.faces)) drawDetections(dres.faces)
+            else drawDetections([])
+          }catch(e){ drawDetections([]) }
           const fd = new FormData()
           fd.append('name', name)
+          fd.append('username', document.getElementById('username-input').value || name.toLowerCase().replace(/\s+/g,'_'))
+          fd.append('email', document.getElementById('email-input').value || '')
+          fd.append('phone', document.getElementById('phone-input').value || '')
+          fd.append('date_of_birth', document.getElementById('dob-input').value || '')
+          const emp = { name: document.getElementById('emergency-name').value || '', phone: document.getElementById('emergency-phone').value || '', relation: document.getElementById('emergency-relation').value || '' }
+          fd.append('emergency_contact', JSON.stringify(emp))
+          fd.append('medications', document.getElementById('medications-input').value || '')
+          fd.append('allergies', document.getElementById('allergies-input').value || '')
+          fd.append('accessibility_needs', document.getElementById('accessibility-input').value || '')
+          fd.append('preferred_language', document.getElementById('language-input').value || '')
+          fd.append('consent_terms', document.getElementById('consent-checkbox').checked ? '1' : '0')
           fd.append('image', dataUrl)
           try{
             const res = await postForm('/signup', fd)
             if(res.ok){
-              messages.textContent = `Registered ${res.name}. You can now login.`
+              messages.textContent = `Registered ${res.display_name || 'user'}. You can now login.`
               signupForm.classList.add('hidden')
               success = true
               break
@@ -162,14 +340,19 @@
         if(!success){
           messages.textContent = 'Registration unsuccessful. Make sure you are well lit and camera is focused on your face.'
           // stop camera after attempts
+          disableManualCapture()
           stopCamera()
         }
-        else { stopCamera() }
+        else { disableManualCapture(); stopCamera() }
       })
 
       document.getElementById('login').addEventListener('click', async ()=>{
         // start camera when attempting login
         await startCamera()
+        // login is automatic; hide manual capture controls
+        disableManualCapture()
+        document.getElementById('center-guide').style.display = 'none'
+        captureBtn.style.display = 'none'
         messages.textContent = 'Attempting login for up to 5 seconds...'
         const start = Date.now()
         const timeout = 5000
@@ -177,14 +360,17 @@
         let found = false
         while(Date.now() - start < timeout && !found){
           const dataUrl = captureFrame()
+          // show detection boxes during login attempts
+          try{ const dres = await postJSON('/api/detect_face', { face_image: dataUrl }); if(dres && Array.isArray(dres.faces)) drawDetections(dres.faces); else drawDetections([]) }catch(e){ drawDetections([]) }
           const fd = new FormData()
           fd.append('image', dataUrl)
           try{
-            const res = await postForm('/login', fd)
+            const res = await postForm('/api/login_face', fd)
             if(res.ok){
               // redirect to welcome page
               stopCamera()
-              window.location = `/welcome?name=${encodeURIComponent(res.name)}`
+              const display = (res.user && res.user.display_name) ? res.user.display_name : (res.display_name || '')
+              window.location = `/welcome?name=${encodeURIComponent(display)}`
               found = true
               break
             }else{
@@ -205,6 +391,7 @@
           stopCamera()
         }
       })
+      // camera will be started when user clicks Sign Up or Login
       // camera will be started when user clicks Sign Up or Login
     </script>
   </body>

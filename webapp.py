@@ -1,163 +1,379 @@
-from flask import Flask, request, jsonify, render_template
-import os
-import io
 import base64
-from PIL import Image
+import io
+import os
 import time
-import pickle
+import uuid
+from typing import Tuple, Optional
 
-print("webapp.py: starting (pid={})".format(os.getpid()), flush=True)
-import os
-import io
-import base64
+from flask import Flask, jsonify, render_template, request
 from PIL import Image
-import time
-import pickle
+from dotenv import load_dotenv
+
+load_dotenv()
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_SERVICE_ROLE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+SUPABASE_DB_URL = os.getenv('SUPABASE_DB_URL') or os.getenv('DATABASE_URL')
+SUPABASE_BUCKET = os.getenv('SUPABASE_BUCKET')
+
+sb = None
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+	try:
+		from supabase import create_client
+
+		sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+	except Exception:
+		sb = None
 
 APP_ROOT = os.path.dirname(__file__)
-DATA_DIR = os.path.join(APP_ROOT, "data")
-IMAGES_DIR = os.path.join(DATA_DIR, "images")
-NAMES_PKL = os.path.join(DATA_DIR, "names.pkl")
-FACES_PKL = os.path.join(DATA_DIR, "faces_data.pkl")
-DIST_THRESHOLD = 0.5
+DATA_DIR = os.path.join(APP_ROOT, 'data')
+DEBUG_DIR = os.path.join(DATA_DIR, 'debug')
+os.makedirs(DEBUG_DIR, exist_ok=True)
 
-app = Flask(__name__, template_folder="templates")
+app = Flask(__name__, template_folder='templates')
 
-def ensure_data_dirs():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(IMAGES_DIR, exist_ok=True)
-    if not os.path.exists(NAMES_PKL):
-        with open(NAMES_PKL, "wb") as f:
-            pickle.dump([], f)
-    if not os.path.exists(FACES_PKL):
-        with open(FACES_PKL, "wb") as f:
-            pickle.dump([], f)
 
-def load_local_embeddings():
-    # lazy import numpy to avoid slow startup during imports
-    import numpy as np
-    ensure_data_dirs()
-    with open(NAMES_PKL, "rb") as f:
-        names = pickle.load(f)
-    with open(FACES_PKL, "rb") as f:
-        faces = pickle.load(f)
-    # convert to numpy arrays
-    faces = [np.array(x) for x in faces]
-    return names, faces
+def coerce_bool(value: Optional[str]) -> bool:
+	if isinstance(value, bool):
+		return value
+	if value is None:
+		return False
+	return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
 
-def save_local_embedding(name, encoding):
-    ensure_data_dirs()
-    # save image info is handled by caller
-    try:
-        with open(NAMES_PKL, "rb") as f:
-            names = pickle.load(f)
-    except Exception:
-        names = []
-    try:
-        with open(FACES_PKL, "rb") as f:
-            faces = pickle.load(f)
-    except Exception:
-        faces = []
-    names.append(name)
-    faces.append(encoding.tolist())
-    with open(NAMES_PKL, "wb") as f:
-        pickle.dump(names, f)
-    with open(FACES_PKL, "wb") as f:
-        pickle.dump(faces, f)
 
-def decode_base64_image(data_url):
-    # data_url like 'data:image/jpeg;base64,/9j/4AAQ...'
-    if "," not in data_url:
-        raise ValueError("Not a data URL")
-    header, b64 = data_url.split(",", 1)
-    img_bytes = base64.b64decode(b64)
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    # lazy import numpy here as well
-    import numpy as np
-    arr = np.array(img)
-    return arr
+def get_db_conn():
+	if not SUPABASE_DB_URL:
+		raise RuntimeError('SUPABASE_DB_URL not set')
+	try:
+		import psycopg2  # type: ignore
+	except Exception as exc:
+		raise RuntimeError('psycopg2 is required: ' + str(exc))
+	conn = psycopg2.connect(SUPABASE_DB_URL)
+	conn.autocommit = False
+	return conn
 
-@app.route("/")
+
+def normalize_public_url(pu) -> str:
+	if pu is None:
+		return ''
+	if isinstance(pu, dict):
+		for key in ('publicURL', 'public_url', 'url'):
+			if pu.get(key):
+				return str(pu[key])
+		values = list(pu.values())
+		return str(values[0]) if values else ''
+	return str(pu)
+
+
+def decode_base64_image(data_url: str) -> Tuple['numpy.ndarray', bytes]:
+	if ',' not in data_url:
+		raise ValueError('invalid data URL')
+	_, b64 = data_url.split(',', 1)
+	img_bytes = base64.b64decode(b64)
+	img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+	import numpy as np
+
+	arr = np.array(img)
+	return arr, img_bytes
+
+
+def save_debug_image(prefix: str, img_arr) -> None:
+	try:
+		name = f"{prefix}_{uuid.uuid4().hex}.jpg"
+		Image.fromarray(img_arr).save(os.path.join(DEBUG_DIR, name))
+	except Exception:
+		app.logger.exception('failed to persist debug image')
+
+
+def ensure_storage_ready():
+	if not sb or not SUPABASE_BUCKET:
+		raise RuntimeError('Supabase storage not configured')
+
+
+def save_image_to_storage(path: str, img_bytes: bytes) -> str:
+	ensure_storage_ready()
+	try:
+		sb.storage.from_(SUPABASE_BUCKET).upload(path, img_bytes)
+		pu = sb.storage.from_(SUPABASE_BUCKET).get_public_url(path)
+		return normalize_public_url(pu)
+	except Exception as exc:
+		app.logger.debug('storage upload failed: %s', repr(exc))
+		try:
+			pu = sb.storage.from_(SUPABASE_BUCKET).get_public_url(path)
+			url = normalize_public_url(pu)
+			if url:
+				return url
+		except Exception:
+			pass
+		import tempfile
+
+		tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+		try:
+			tmp_file.write(img_bytes)
+			tmp_file.flush()
+			tmp_file.close()
+			with open(tmp_file.name, 'rb') as handle:
+				sb.storage.from_(SUPABASE_BUCKET).upload(path, handle.read())
+			pu = sb.storage.from_(SUPABASE_BUCKET).get_public_url(path)
+			return normalize_public_url(pu)
+		finally:
+			try:
+				os.unlink(tmp_file.name)
+			except Exception:
+				pass
+
+
+def download_from_storage(path: str) -> bytes:
+	ensure_storage_ready()
+	try:
+		data = sb.storage.from_(SUPABASE_BUCKET).download(path)
+		if isinstance(data, (bytes, bytearray)):
+			return bytes(data)
+		if isinstance(data, dict) and 'data' in data:
+			return bytes(data['data'])
+	except Exception:
+		pass
+	pu = sb.storage.from_(SUPABASE_BUCKET).get_public_url(path)
+	url = normalize_public_url(pu)
+	if not url:
+		raise RuntimeError('unable to retrieve file from storage')
+	import requests
+
+	resp = requests.get(url, timeout=30)
+	resp.raise_for_status()
+	return resp.content
+
+
+def compute_face_encoding(img_arr):
+	try:
+		import face_recognition
+	except Exception as exc:
+		raise RuntimeError('face_recognition import failed: ' + str(exc))
+	# Log image details for debugging
+	app.logger.debug('face detection: image shape %s, dtype %s', img_arr.shape, img_arr.dtype)
+	# Use 'large' model for better accuracy, add jitters for robustness
+	encodings = face_recognition.face_encodings(img_arr, model='large', num_jitters=5, num_upsamples=2)
+	app.logger.debug('face detection: found %d encodings', len(encodings))
+	if not encodings:
+		return None
+	return encodings[0]
+def insert_embedding(cur, user_id: int, encoding, source: str) -> None:
+	vec_vals = ','.join(repr(float(x)) for x in encoding)
+	for cast in ('vector', 'float8[]'):
+		try:
+			literal = f"ARRAY[{vec_vals}]::{cast}"
+			sql = f"""
+				INSERT INTO public.embeddings (user_id, embedding, source, created_at)
+				VALUES (%s, {literal}, %s, now())
+			"""
+			cur.execute(sql, (user_id, source))
+			return
+		except Exception as exc:
+			app.logger.debug('embedding insert failed (%s): %s', cast, repr(exc))
+	raise RuntimeError('embedding insert failed for all casts')
+
+
+@app.errorhandler(404)
+def handle_404(err):
+	try:
+		if request.path.startswith('/api/'):
+			return jsonify({'ok': False, 'error': 'not_found', 'path': request.path}), 404
+	except Exception:
+		pass
+	return err
+
+
+@app.route('/_routes', methods=['GET'])
+def list_routes():
+	rules = sorted(rule.rule for rule in app.url_map.iter_rules())
+	return jsonify({'routes': rules})
+
+
+@app.route('/', methods=['GET'])
 def index():
-    return render_template("index.html")
+	template = app.template_folder or ''
+	index_path = os.path.join(template, 'index.html')
+	if template and os.path.exists(index_path):
+		return render_template('index.html')
+	return 'OK'
 
-@app.route("/signup", methods=["POST"])
+
+@app.route('/signup', methods=['GET'])
 def signup():
-    # expects form fields: name, image (data URL)
-    name = request.form.get("name", "").strip()
-    image_data = request.form.get("image", "")
-    app.logger.info(f"signup request for name={name} received")
-    if not name:
-        app.logger.warning("signup: missing name")
-        return jsonify({"ok": False, "error": "missing_name"}), 400
-    if not image_data:
-        app.logger.warning("signup: missing image")
-        return jsonify({"ok": False, "error": "missing_image"}), 400
-    try:
-        img = decode_base64_image(image_data)
-    except Exception as e:
-        app.logger.exception("signup: bad_image")
-        return jsonify({"ok": False, "error": "bad_image", "detail": str(e)}), 400
-
-    # lazy import face_recognition to avoid heavy import during startup
-    import face_recognition
-    encs = face_recognition.face_encodings(img)
-    if not encs:
-        app.logger.info("signup: no face detected in captured frame")
-        # include a helpful suggestion in the response
-        return jsonify({"ok": False, "error": "no_face", "detail": "No face detected. Ensure your face is centered, well-lit, and unobstructed."}), 200
-
-    encoding = encs[0]
-    # save image to data/images/<name>/timestamp.jpg
-    person_dir = os.path.join(IMAGES_DIR, name)
-    os.makedirs(person_dir, exist_ok=True)
-    filename = os.path.join(person_dir, f"{int(time.time())}.jpg")
-    # save with PIL (image is RGB)
-    Image.fromarray(img).save(filename)
-
-    save_local_embedding(name, encoding)
-    app.logger.info(f"signup: saved embedding and image for {name}")
-    return jsonify({"ok": True, "name": name})
-
-@app.route("/login", methods=["POST"])
-def login():
-    # expects form field: image (data URL)
-    image_data = request.form.get("image", "")
-    if not image_data:
-        return jsonify({"ok": False, "error": "missing_image"}), 400
-    try:
-        img = decode_base64_image(image_data)
-    except Exception as e:
-        return jsonify({"ok": False, "error": "bad_image", "detail": str(e)}), 400
-
-    import face_recognition
-    encs = face_recognition.face_encodings(img)
-    if not encs:
-        return jsonify({"ok": False, "error": "no_face"}), 200
-    encoding = encs[0]
-    names, faces = load_local_embeddings()
-    if not names:
-        return jsonify({"ok": False, "error": "no_registered"}), 200
-
-    # compute distances
-    faces_np = faces
-    dists = face_recognition.face_distance(faces_np, encoding)
-    # avoid importing numpy here; use ndarray method
-    min_idx = int(dists.argmin())
-    min_dist = float(dists[min_idx])
-    if min_dist <= DIST_THRESHOLD:
-        return jsonify({"ok": True, "name": names[min_idx], "distance": min_dist}), 200
-    else:
-        return jsonify({"ok": False, "error": "no_match", "min_distance": min_dist}), 200
+	tmpl = app.template_folder or ''
+	page = os.path.join(tmpl, 'welcome.html')
+	if tmpl and os.path.exists(page):
+		return render_template('welcome.html')
+	return render_template('index.html') if os.path.exists(os.path.join(tmpl, 'index.html')) else 'Signup'
 
 
-@app.route("/welcome")
-def welcome():
-    # simple page shown after successful login; template reads query param or we could pass name
-    return render_template("welcome.html")
+@app.route('/api/upload_face', methods=['POST'])
+def api_upload_face():
+	payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+	data_url = payload.get('face_image') or payload.get('image')
+	if not data_url:
+		return jsonify({'ok': False, 'error': 'missing_image'}), 400
+	try:
+		img_arr, img_bytes = decode_base64_image(data_url)
+	except Exception as exc:
+		return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
 
-if __name__ == "__main__":
-    # quick safety: create data dir
-    ensure_data_dirs()
-    print("webapp.py: launching Flask on http://0.0.0.0:5000", flush=True)
-    app.run(host="0.0.0.0", port=5000, debug=True)
+	save_debug_image('upload', img_arr)
+
+	try:
+		ensure_storage_ready()
+	except Exception as exc:
+		return jsonify({'ok': False, 'error': 'storage_not_configured', 'detail': str(exc)}), 500
+
+	temp_path = f"temp/{uuid.uuid4().hex}.jpg"
+	try:
+		public_url = save_image_to_storage(temp_path, img_bytes)
+	except Exception as exc:
+		return jsonify({'ok': False, 'error': 'upload_failed', 'detail': str(exc)}), 500
+
+	return jsonify({'ok': True, 'temp_storage_path': temp_path, 'public_url': public_url}), 200
+
+
+def load_image_from_temp(temp_path: str):
+	img_bytes = download_from_storage(temp_path)
+	img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+	import numpy as np
+
+	return np.array(img), img_bytes
+
+
+@app.route('/api/register', methods=['POST'])
+def api_register():
+	payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+	display_name = payload.get('display_name') or payload.get('name')
+	username = payload.get('username')
+	email = payload.get('email')
+	phone = payload.get('phone')
+	consent = coerce_bool(payload.get('consent_terms'))
+	data_url = payload.get('face_image') or payload.get('image')
+	temp_path = payload.get('temp_storage_path')
+
+	if not display_name or not username or not consent or not (data_url or temp_path):
+		return jsonify({'ok': False, 'error': 'missing_fields'}), 400
+
+	try:
+		if temp_path:
+			img_arr, img_bytes = load_image_from_temp(temp_path)
+		else:
+			img_arr, img_bytes = decode_base64_image(data_url)
+	except Exception as exc:
+		app.logger.exception('register: load image failed')
+		return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
+
+	save_debug_image('register', img_arr)
+
+	encoding = compute_face_encoding(img_arr)
+	if encoding is None:
+		return jsonify({'ok': False, 'error': 'no_face', 'message': 'No face detected. Ensure good lighting, clear focus on face, and try again.'}), 200
+
+	try:
+		ensure_storage_ready()
+	except Exception as exc:
+		return jsonify({'ok': False, 'error': 'storage_not_configured', 'detail': str(exc)}), 500
+
+	conn = get_db_conn()
+	cur = conn.cursor()
+	try:
+		cur.execute(
+			"""
+				INSERT INTO public.users (display_name, username, email, phone, created_at)
+				VALUES (%s, %s, %s, %s, now())
+				ON CONFLICT (username) DO UPDATE SET display_name = EXCLUDED.display_name
+				RETURNING id
+			""",
+			(display_name, username, email, phone),
+		)
+		user_id = cur.fetchone()[0]
+
+		filename = os.path.basename(temp_path) if temp_path else f"{int(time.time())}_{uuid.uuid4().hex}.jpg"
+		storage_path = f"{user_id}/{filename}"
+		public_url = save_image_to_storage(storage_path, img_bytes)
+
+		cur.execute(
+			"""
+				INSERT INTO public.user_images (user_id, storage_path, public_url, width, height, mime_type, uploaded_at, is_profile, file_size)
+				VALUES (%s, %s, %s, %s, %s, %s, now(), %s, %s)
+			""",
+			(
+				user_id,
+				storage_path,
+				public_url,
+				img_arr.shape[1],
+				img_arr.shape[0],
+				'image/jpeg',
+				True,
+				len(img_bytes),
+			),
+		)
+
+		insert_embedding(cur, user_id, encoding, 'signup')
+		conn.commit()
+	except Exception as exc:
+		conn.rollback()
+		app.logger.exception('register: db error')
+		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+	finally:
+		cur.close()
+		conn.close()
+
+	return jsonify({'ok': True, 'user_id': str(user_id), 'profile_image_url': public_url}), 201
+
+
+@app.route('/api/login_face', methods=['POST'])
+def api_login_face():
+	payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+	data_url = payload.get('face_image') or payload.get('image')
+	if not data_url:
+		return jsonify({'ok': False, 'error': 'missing_image'}), 400
+	try:
+		img_arr, _ = decode_base64_image(data_url)
+	except Exception as exc:
+		return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
+
+	encoding = compute_face_encoding(img_arr)
+	if encoding is None:
+		return jsonify({'ok': False, 'error': 'no_face', 'message': 'No face detected. Ensure good lighting, clear focus on face, and try again.'}), 200
+
+	threshold = float(payload.get('threshold') or 0.5)
+	limit = int(payload.get('limit') or 1)
+	conn = get_db_conn()
+	cur = conn.cursor()
+	try:
+		vec_literal = 'ARRAY[' + ','.join(repr(float(x)) for x in encoding) + ']::vector'
+		sql = f"""
+			SELECT embedding_id, user_id, dist
+			FROM public.find_nearest_embeddings({vec_literal}, %s)
+			LIMIT %s
+		"""
+		cur.execute(sql, (threshold, limit))
+		row = cur.fetchone()
+		if not row:
+			conn.commit()
+			return jsonify({'ok': False, 'error': 'no_match'}), 200
+		_, user_id, dist = row
+		cur.execute('SELECT id, display_name, username FROM public.users WHERE id = %s', (user_id,))
+		user_row = cur.fetchone()
+		conn.commit()
+	except Exception as exc:
+		conn.rollback()
+		app.logger.exception('login_face: db error')
+		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+	finally:
+		cur.close()
+		conn.close()
+
+	if not user_row:
+		return jsonify({'ok': False, 'error': 'user_missing'}), 404
+	if dist > threshold:
+		return jsonify({'ok': False, 'error': 'no_match', 'min_distance': float(dist)}), 200
+	return jsonify({'ok': True, 'user': {'id': str(user_row[0]), 'display_name': user_row[1], 'username': user_row[2]}, 'distance': float(dist)}), 200
+
+
+if __name__ == '__main__':
+	os.makedirs(DATA_DIR, exist_ok=True)
+	print('webapp.py: launching Flask on http://0.0.0.0:5000', flush=True)
+	app.run(host='0.0.0.0', port=5000, debug=True)

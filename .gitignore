@@ -11,6 +11,19 @@ data/*.jpg
 data/*.jpeg
 data/*.png
 data/faces.pkl
+data/debug/
+data/temp/
+
+# Ignore tests, migrations and generated SQL that shouldn't be tracked
+tests/
+migrations/
+SUPABASE_SCHEMA.sql
+SUPABASE_MIGRATION.md
+
+# Local temp files
+*.log
+.vscode/
+.idea/
 
 # OS files
 .DS_Store
