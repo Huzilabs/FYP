@@ -3,3 +3,7 @@ face_recognition
 opencv-python
 numpy
 Pillow
+python-dotenv
+supabase
+psycopg2-binary
+requests
