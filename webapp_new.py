@@ -385,16 +385,33 @@ def api_detect_face():
 		elif isinstance(data_url, str) and data_url.startswith('data:'):
 			img_arr, _ = decode_base64_image(data_url)
 		else:
-			# Try downloading from storage (treat as storage path). If that fails,
-			# fall back to attempting to decode as a base64 string.
-			try:
-				raw = download_from_storage(data_url)
-				img_bytes = raw
-				from PIL import Image as PILImage
-				img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
-				img_arr = np.array(img)
-			except Exception:
-				img_arr, _ = decode_base64_image(data_url)
+			# Treat input as a storage path: prefer resolving a public URL and fetching
+			# that URL so frontends can simply pass the public link. If that fails,
+			# fall back to direct download_from_storage or base64 decode.
+			fetched = False
+			if sb and SUPABASE_BUCKET:
+				try:
+					pub = _public_or_signed_url(data_url)
+					if pub:
+						import requests
+						r = requests.get(pub, timeout=20)
+						r.raise_for_status()
+						img_bytes = r.content
+						from PIL import Image as PILImage
+						img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
+						img_arr = np.array(img)
+						fetched = True
+				except Exception:
+					fetched = False
+			if not fetched:
+				try:
+					raw = download_from_storage(data_url)
+					img_bytes = raw
+					from PIL import Image as PILImage
+					img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
+					img_arr = np.array(img)
+				except Exception:
+					img_arr, _ = decode_base64_image(data_url)
 	except Exception as exc:
 		return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
 
@@ -466,7 +483,7 @@ def api_capture_face():
 	if not data_url:
 		return jsonify({'ok': False, 'error': 'missing_image'}), 400
 
-	# Accept data URL, HTTP(S) URL, or storage path
+	# Accept data URL, HTTP(S) URL, or storage path. Prefer public URL for storage paths.
 	try:
 		if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
 			import requests
@@ -478,13 +495,28 @@ def api_capture_face():
 		elif isinstance(data_url, str) and data_url.startswith('data:'):
 			img_arr, img_bytes = decode_base64_image(data_url)
 		else:
-			try:
-				raw = download_from_storage(data_url)
-				img_bytes = raw
-				img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-				img_arr = np.array(img)
-			except Exception:
-				img_arr, img_bytes = decode_base64_image(data_url)
+			fetched = False
+			if sb and SUPABASE_BUCKET:
+				try:
+					pub = _public_or_signed_url(data_url)
+					if pub:
+						import requests
+						r = requests.get(pub, timeout=20)
+						r.raise_for_status()
+						img_bytes = r.content
+						img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+						img_arr = np.array(img)
+						fetched = True
+				except Exception:
+					fetched = False
+			if not fetched:
+				try:
+					raw = download_from_storage(data_url)
+					img_bytes = raw
+					img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+					img_arr = np.array(img)
+				except Exception:
+					img_arr, img_bytes = decode_base64_image(data_url)
 	except Exception as exc:
 		return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
 
@@ -773,7 +805,7 @@ def api_attach_image():
 
 	try:
 		if data_url:
-			# Accept HTTP(S) URL, data URL, or treat as storage path
+			# Accept HTTP(S) URL, data URL, or treat as storage path. Prefer public URL.
 			if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
 				import requests
 				r = requests.get(data_url, timeout=20)
@@ -784,13 +816,28 @@ def api_attach_image():
 			elif isinstance(data_url, str) and data_url.startswith('data:'):
 				img_arr, img_bytes = decode_base64_image(data_url)
 			else:
-				try:
-					raw = download_from_storage(data_url)
-					img_bytes = raw
-					img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-					img_arr = np.array(img)
-				except Exception:
-					img_arr, img_bytes = decode_base64_image(data_url)
+				fetched = False
+				if sb and SUPABASE_BUCKET:
+					try:
+						pub = _public_or_signed_url(data_url)
+						if pub:
+							import requests
+							r = requests.get(pub, timeout=20)
+							r.raise_for_status()
+							img_bytes = r.content
+							img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+							img_arr = np.array(img)
+							fetched = True
+					except Exception:
+						fetched = False
+				if not fetched:
+					try:
+						raw = download_from_storage(data_url)
+						img_bytes = raw
+						img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+						img_arr = np.array(img)
+					except Exception:
+						img_arr, img_bytes = decode_base64_image(data_url)
 		else:
 			raw = download_from_storage(temp_path)
 			img_bytes = raw
@@ -887,13 +934,28 @@ def api_login_face():
 		elif isinstance(data_url, str) and data_url.startswith('data:'):
 			img_arr, _ = decode_base64_image(data_url)
 		else:
-			try:
-				raw = download_from_storage(data_url)
-				img_bytes = raw
-				img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-				img_arr = np.array(img)
-			except Exception:
-				img_arr, _ = decode_base64_image(data_url)
+			fetched = False
+			if sb and SUPABASE_BUCKET:
+				try:
+					pub = _public_or_signed_url(data_url)
+					if pub:
+						import requests
+						r = requests.get(pub, timeout=20)
+						r.raise_for_status()
+						img_bytes = r.content
+						img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+						img_arr = np.array(img)
+						fetched = True
+				except Exception:
+					fetched = False
+			if not fetched:
+				try:
+					raw = download_from_storage(data_url)
+					img_bytes = raw
+					img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+					img_arr = np.array(img)
+				except Exception:
+					img_arr, _ = decode_base64_image(data_url)
 	except Exception as exc:
 		return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
 
