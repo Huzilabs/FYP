@@ -368,8 +368,33 @@ def api_detect_face():
 	data_url = payload.get('face_image') or payload.get('image')
 	if not data_url:
 		return jsonify({'ok': False, 'error': 'missing_image'}), 400
+	# Accept either a data URL (base64), an HTTP(S) URL (public Supabase URL),
+	# or a Supabase storage path (download via download_from_storage).
+	img_arr = None
 	try:
-		img_arr, _ = decode_base64_image(data_url)
+		# HTTP(S) URL: fetch bytes via requests
+		if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
+			import requests
+			resp = requests.get(data_url, timeout=20)
+			resp.raise_for_status()
+			img_bytes = resp.content
+			from PIL import Image as PILImage
+			img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
+			img_arr = np.array(img)
+		# Data URL (base64): decode locally
+		elif isinstance(data_url, str) and data_url.startswith('data:'):
+			img_arr, _ = decode_base64_image(data_url)
+		else:
+			# Try downloading from storage (treat as storage path). If that fails,
+			# fall back to attempting to decode as a base64 string.
+			try:
+				raw = download_from_storage(data_url)
+				img_bytes = raw
+				from PIL import Image as PILImage
+				img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
+				img_arr = np.array(img)
+			except Exception:
+				img_arr, _ = decode_base64_image(data_url)
 	except Exception as exc:
 		return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
 
@@ -380,6 +405,8 @@ def api_detect_face():
 
 	locations = face_recognition.face_locations(img_arr, model='large', number_of_times_to_upsample=2)
 	faces = [{'top': t, 'right': r, 'bottom': b, 'left': l} for t, r, b, l in locations]
+
+	# Read-only detect: return bounding boxes only (no DB writes).
 	return jsonify({'ok': True, 'faces': faces}), 200
 
 
@@ -439,8 +466,25 @@ def api_capture_face():
 	if not data_url:
 		return jsonify({'ok': False, 'error': 'missing_image'}), 400
 
+	# Accept data URL, HTTP(S) URL, or storage path
 	try:
-		img_arr, img_bytes = decode_base64_image(data_url)
+		if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
+			import requests
+			resp = requests.get(data_url, timeout=20)
+			resp.raise_for_status()
+			img_bytes = resp.content
+			img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+			img_arr = np.array(img)
+		elif isinstance(data_url, str) and data_url.startswith('data:'):
+			img_arr, img_bytes = decode_base64_image(data_url)
+		else:
+			try:
+				raw = download_from_storage(data_url)
+				img_bytes = raw
+				img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+				img_arr = np.array(img)
+			except Exception:
+				img_arr, img_bytes = decode_base64_image(data_url)
 	except Exception as exc:
 		return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
 
@@ -633,12 +677,30 @@ def api_register():
 		conn.close()
 
 	# If the client provided an image data URL or temp path, attach it to the user and insert embedding
-	image_data_url = payload.get('image') or payload.get('face_image')
+	image_data_url = payload.get('image') or payload.get('face_image') or payload.get('image_url')
 	temp_path = payload.get('temp_storage_path') or payload.get('temp_path')
 	if image_data_url or temp_path:
 		try:
 			if image_data_url:
-				img_arr, img_bytes = decode_base64_image(image_data_url)
+				# Accept data URL, HTTP(S) URL, or storage path
+				if isinstance(image_data_url, str) and (image_data_url.startswith('http://') or image_data_url.startswith('https://')):
+					import requests
+					resp = requests.get(image_data_url, timeout=20)
+					resp.raise_for_status()
+					img_bytes = resp.content
+					img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+					img_arr = np.array(img)
+				elif isinstance(image_data_url, str) and image_data_url.startswith('data:'):
+					img_arr, img_bytes = decode_base64_image(image_data_url)
+				else:
+					# treat as storage path
+					try:
+						raw = download_from_storage(image_data_url)
+						img_bytes = raw
+						img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+						img_arr = np.array(img)
+					except Exception:
+						img_arr, img_bytes = decode_base64_image(image_data_url)
 			else:
 				# download from temp storage and re-upload into user folder
 				raw = download_from_storage(temp_path)
@@ -711,7 +773,24 @@ def api_attach_image():
 
 	try:
 		if data_url:
-			img_arr, img_bytes = decode_base64_image(data_url)
+			# Accept HTTP(S) URL, data URL, or treat as storage path
+			if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
+				import requests
+				r = requests.get(data_url, timeout=20)
+				r.raise_for_status()
+				img_bytes = r.content
+				img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+				img_arr = np.array(img)
+			elif isinstance(data_url, str) and data_url.startswith('data:'):
+				img_arr, img_bytes = decode_base64_image(data_url)
+			else:
+				try:
+					raw = download_from_storage(data_url)
+					img_bytes = raw
+					img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+					img_arr = np.array(img)
+				except Exception:
+					img_arr, img_bytes = decode_base64_image(data_url)
 		else:
 			raw = download_from_storage(temp_path)
 			img_bytes = raw
@@ -796,8 +875,25 @@ def api_login_face():
 	data_url = payload.get('face_image') or payload.get('image')
 	if not data_url:
 		return jsonify({'ok': False, 'error': 'missing_image'}), 400
+	# Accept data URL, HTTP(S) URL, or storage path
 	try:
-		img_arr, _ = decode_base64_image(data_url)
+		if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
+			import requests
+			resp = requests.get(data_url, timeout=20)
+			resp.raise_for_status()
+			img_bytes = resp.content
+			img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+			img_arr = np.array(img)
+		elif isinstance(data_url, str) and data_url.startswith('data:'):
+			img_arr, _ = decode_base64_image(data_url)
+		else:
+			try:
+				raw = download_from_storage(data_url)
+				img_bytes = raw
+				img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+				img_arr = np.array(img)
+			except Exception:
+				img_arr, _ = decode_base64_image(data_url)
 	except Exception as exc:
 		return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
 
