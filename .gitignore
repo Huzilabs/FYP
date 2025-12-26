@@ -1,5 +1,5 @@
-# Ignore environment and secrets
 .env
+*.env.local
 venv/
 env/
 __pycache__/
@@ -28,3 +28,55 @@ SUPABASE_MIGRATION.md
 # OS files
 .DS_Store
 Thumbs.db
+
+# Project-specific files to ignore (user requested)
+scripts/
+add_faces.py
+app.py
+.env
+*.env.local
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Ignore images and large data
+data/images/
+data/*.jpg
+data/*.jpeg
+data/*.png
+data/faces.pkl
+data/debug/
+data/temp/
+
+# Ignore tests, migrations and generated SQL that shouldn't be tracked
+tests/
+migrations/
+SUPABASE_SCHEMA.sql
+SUPABASE_MIGRATION.md
+
+# Local temp files
+*.log
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project-specific files to ignore (user requested)
+scripts/
+add_faces.py
+app.py
+
+# Frontend build/dev artifacts
+face-auth-frontend/.next/
+face-auth-frontend/node_modules/
+face-auth-frontend/.vercel/
+face-auth-frontend/.turbo/
+face-auth-frontend/.cache/
+face-auth-frontend/package-lock.json
+face-auth-frontend/.env.local
+
+# Misc
+next-env.d.ts

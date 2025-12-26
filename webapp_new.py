@@ -45,27 +45,48 @@ handler.setFormatter(formatter)
 app.logger.addHandler(handler)
 app.logger.setLevel(logging.DEBUG)
 
+
+@app.before_request
+def _handle_cors_preflight():
+	"""Handle CORS preflight OPTIONS requests."""
+	if request.method == 'OPTIONS':
+		response = jsonify({'ok': True})
+		response.status_code = 200
+		return _set_cors_headers(response)
+
+
+@app.after_request
+def _set_cors_headers(response):
+	"""Add CORS headers to all responses for localhost:3000."""
+	origin = request.headers.get('Origin', '')
+	if 'localhost:3000' in origin or origin == 'http://localhost:3000':
+		response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+		response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS,HEAD'
+		response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,X-User-Id'
+		response.headers['Access-Control-Allow-Credentials'] = 'true'
+		response.headers['Access-Control-Max-Age'] = '3600'
+	return response
+
 # Cache whether pgvector `vector` type exists to avoid repeated checks
 _HAS_VECTOR = None
 
 
 def _detect_vector_type() -> bool:
 	global _HAS_VECTOR
-	if _HAS_VECTOR is not None:
-		return _HAS_VECTOR
+	# If we've previously determined pgvector exists, return cached True immediately.
+	if _HAS_VECTOR is True:
+		return True
+	# Otherwise, re-check the DB (this allows a prior False cache to be re-evaluated
+	# after migrations or admin changes).
 	try:
 		conn = None
 		try:
 			conn = get_db_conn()
-			# run detection in autocommit mode to avoid interacting with caller transactions
-			conn.autocommit = True
 			cur = conn.cursor()
-			cur.execute("SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname = %s)", ('vector',))
+			# Check both pg_extension (installation) and pg_type (type existence with schema)
+			cur.execute("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector') OR EXISTS(SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'vector')")
 			_HAS_VECTOR = bool(cur.fetchone()[0])
-			try:
-				cur.close()
-			except Exception:
-				pass
+			cur.close()
 		finally:
 			try:
 				if conn:
@@ -73,6 +94,7 @@ def _detect_vector_type() -> bool:
 			except Exception:
 				pass
 	except Exception:
+		app.logger.exception('error detecting pgvector type')
 		_HAS_VECTOR = False
 	return _HAS_VECTOR
 
@@ -120,19 +142,54 @@ def get_db_conn():
 		raise RuntimeError('psycopg2 is required: ' + str(exc))
 	conn = psycopg2.connect(SUPABASE_DB_URL)
 	conn.autocommit = False
+	# Ensure pgvector types in a non-public schema (e.g. vector_ext) are visible
+	# by preferring that schema in the search_path. This lets casts like ::vector
+	# resolve when the extension is installed into `vector_ext`.
+	try:
+		cur = conn.cursor()
+		# prefer vector_ext then public; if schema doesn't exist this is a no-op
+		cur.execute("SET search_path = vector_ext, public;")
+		cur.close()
+	except Exception:
+		# best-effort: if this fails, leave connection as-is and let callers handle errors
+		app.logger.debug('failed to set search_path to include vector_ext')
 	return conn
 
 
 def normalize_public_url(pu) -> str:
+	"""Normalize Supabase storage URL results into a usable string.
+
+	Accepts either a dict response (older/newer SDKs) or a plain string.
+	Strips whitespace and a trailing lone "?" that some SDK calls return.
+	Returns empty string when the value is missing or clearly invalid.
+	"""
 	if pu is None:
 		return ''
+	# If SDK returns a dict, try common keys for public/signed URLs
 	if isinstance(pu, dict):
-		for key in ('publicURL', 'public_url', 'url'):
-			if pu.get(key):
-				return str(pu[key])
-		values = list(pu.values())
-		return str(values[0]) if values else ''
-	return str(pu)
+		for key in ('publicURL', 'public_url', 'publicUrl', 'signedURL', 'signed_url', 'signedUrl', 'url'):
+			v = pu.get(key)
+			if v:
+				pu = v
+				break
+		else:
+			# fallback to first value
+			values = [v for v in pu.values() if v]
+			pu = values[0] if values else ''
+
+	s = '' if pu is None else str(pu).strip()
+	if not s:
+		return ''
+
+	# Some Supabase responses append a trailing '?' with empty query; remove it.
+	if s.endswith('?'):
+		s = s[:-1].rstrip()
+
+	# Guard against placeholder strings
+	if s.lower() in ('not_found', 'none', 'null', ''):
+		return ''
+
+	return s
 
 
 def decode_base64_image(data_url: str) -> Tuple[np.ndarray, bytes]:
@@ -160,15 +217,28 @@ def ensure_storage_ready():
 
 def _public_or_signed_url(path: str) -> str:
 	"""Return best-effort public URL; fallback to signed URL if bucket is private."""
+	# First try public URL returned by the SDK
 	try:
 		pu = sb.storage.from_(SUPABASE_BUCKET).get_public_url(path)
 		app.logger.debug('get_public_url raw response: %r', pu)
 		url = normalize_public_url(pu)
 		app.logger.debug('normalized public url: %s', url)
-		if url and 'not_found' not in url:
-			return url
+		if url:
+			# perform a lightweight HEAD check to ensure URL is reachable
+			try:
+				import requests
+				resp = requests.head(url, allow_redirects=True, timeout=5)
+				if resp.status_code in (200, 206):
+					return url
+				app.logger.debug('public url HEAD returned %s, falling back to signed url', resp.status_code)
+			except Exception:
+				# If HEAD fails (CORS/private bucket), still attempt signed URL fallback
+				app.logger.debug('public url HEAD check failed, will try signed URL')
+				pass
 	except Exception:
-		pass
+		app.logger.debug('get_public_url call failed, will try signed URL')
+
+	# Fallback: create a long-lived signed URL using the service role key
 	try:
 		signed = sb.storage.from_(SUPABASE_BUCKET).create_signed_url(path, 60 * 60 * 24 * 365)  # 1 year
 		app.logger.debug('create_signed_url raw response: %r', signed)
@@ -177,7 +247,8 @@ def _public_or_signed_url(path: str) -> str:
 		if url:
 			return url
 	except Exception:
-		pass
+		app.logger.exception('create_signed_url failed for path: %s', path)
+
 	return ''
 
 
@@ -237,15 +308,18 @@ def download_from_storage(path: str) -> bytes:
 
 
 def compute_face_encoding(img_arr):
+	"""Compute face encoding. Returns None if face_recognition unavailable or no face detected."""
 	try:
 		import face_recognition
 	except Exception as exc:
-		raise RuntimeError('face_recognition import failed: ' + str(exc))
+		app.logger.warning('face_recognition not available: %s', str(exc))
+		return None     
 	# Log image details for debugging
 	app.logger.debug('face detection: image shape %s, dtype %s', img_arr.shape, img_arr.dtype)
 	print(f'compute_face_encoding: image shape={getattr(img_arr, "shape", None)}', flush=True)
 	# Fast path: prefer the lightweight `hog` detector with minimal upsampling
 	# and low jitter for encoding. If hog finds no faces, fall back to cnn.
+	
 	locations = []
 	try:
 		locations = face_recognition.face_locations(img_arr, model='hog', number_of_times_to_upsample=0)
@@ -418,7 +492,11 @@ def api_detect_face():
 	try:
 		import face_recognition
 	except Exception as exc:
-		return jsonify({'ok': False, 'error': 'face_recognition_failed', 'detail': str(exc)}), 500
+		return jsonify({
+			'ok': False,
+			'error': 'face_recognition_unavailable',
+			'detail': 'face_recognition library not installed. Image upload still works but face detection disabled.'
+		}), 501
 
 	locations = face_recognition.face_locations(img_arr, model='large', number_of_times_to_upsample=2)
 	faces = [{'top': t, 'right': r, 'bottom': b, 'left': l} for t, r, b, l in locations]
@@ -522,9 +600,10 @@ def api_capture_face():
 
 	save_debug_image('capture', img_arr)
 
+	# Try to compute encoding, but allow capture even if face_recognition unavailable
 	encoding = compute_face_encoding(img_arr)
 	if encoding is None:
-		return jsonify({'ok': False, 'error': 'no_face', 'message': 'No face detected. Ensure good lighting, clear focus on face, and try again.'}), 200
+		app.logger.warning('capture_face: no encoding computed (face_recognition unavailable or no face detected)')
 
 	try:
 		ensure_storage_ready()
@@ -585,7 +664,12 @@ def api_capture_face():
 			),
 		)
 
-		insert_embedding(cur, user_id, encoding, 'capture')
+		# Insert embedding only if we have one
+		if encoding is not None:
+			try:
+				insert_embedding(cur, user_id, encoding, 'capture')
+			except Exception:
+				app.logger.exception('capture_face: embedding insert failed, continuing')
 		conn.commit()
 	except Exception as exc:
 		conn.rollback()
@@ -734,7 +818,7 @@ def api_register():
 					except Exception:
 						img_arr, img_bytes = decode_base64_image(image_data_url)
 			else:
-				# download from temp storage and re-upload into user folder
+				# download the temp file from storage and reuse its storage path (do NOT re-upload)
 				raw = download_from_storage(temp_path)
 				img_bytes = raw
 				from PIL import Image as PILImage
@@ -746,9 +830,18 @@ def api_register():
 			conn = get_db_conn()
 			cur = conn.cursor()
 			try:
-				filename = f"{int(time.time())}_{uuid.uuid4().hex}.jpg"
-				storage_path = f"{user_id}/{filename}"
-				public_url = save_image_to_storage(storage_path, img_bytes) or storage_path
+				# If the frontend provided a temp storage path, keep that path (e.g. "Registration/...")
+				# rather than re-uploading into a new user-specific folder. We still download
+				# the object to compute dimensions and embeddings.
+				if temp_path:
+					# normalize path and avoid leading slashes
+					storage_path = temp_path.lstrip('/')
+					public_url = _public_or_signed_url(storage_path) or storage_path
+				else:
+					# fallback: create user folder and upload
+					filename = f"{int(time.time())}_{uuid.uuid4().hex}.jpg"
+					storage_path = f"{user_id}/{filename}"
+					public_url = save_image_to_storage(storage_path, img_bytes) or storage_path
 				cur.execute(
 					"""
 						INSERT INTO public.user_images (user_id, storage_path, public_url, width, height, mime_type, uploaded_at, is_profile, file_size)
@@ -765,9 +858,17 @@ def api_register():
 						len(img_bytes),
 					),
 				)
+				# Try to compute encoding and insert embedding separately
+				# This is optional - registration succeeds even without face encoding
 				encoding = compute_face_encoding(img_arr)
 				if encoding is not None:
-					insert_embedding(cur, user_id, encoding, 'register')
+					try:
+						insert_embedding(cur, user_id, encoding, 'register')
+						app.logger.info('register: embedding inserted successfully')
+					except Exception:
+						app.logger.warning('register: failed to insert embedding, continuing')
+				else:
+					app.logger.warning('register: no encoding computed (face_recognition unavailable or no face)')
 				conn.commit()
 			except Exception as exc:
 				conn.rollback()
@@ -887,6 +988,7 @@ def api_attach_image():
 				pass
 
 		# Try to compute encoding and insert embedding separately
+		# This is optional - image attachment succeeds even without face encoding
 		try:
 			encoding = compute_face_encoding(img_arr)
 			if encoding is not None:
@@ -895,20 +997,23 @@ def api_attach_image():
 				try:
 					insert_embedding(emb_cur, user_id, encoding, 'attach')
 					emb_conn.commit()
+					app.logger.info('attach_image: embedding inserted successfully')
 				except Exception:
 					try:
 						emb_conn.rollback()
 					except Exception:
 						pass
-					app.logger.exception('attach_image: failed to insert embedding')
+					app.logger.warning('attach_image: failed to insert embedding, continuing')
 				finally:
 					try:
 						emb_cur.close()
 						emb_conn.close()
 					except Exception:
 						pass
+			else:
+				app.logger.warning('attach_image: no encoding computed (face_recognition unavailable or no face)')
 		except Exception:
-			app.logger.exception('attach_image: encoding failed')
+			app.logger.warning('attach_image: encoding computation failed, continuing without embedding')
 
 		return jsonify({'ok': True, 'storage_path': storage_path, 'public_url': public_url}), 201
 	except Exception as exc:
@@ -918,44 +1023,71 @@ def api_attach_image():
 
 @app.route('/api/login_face', methods=['POST'])
 def api_login_face():
+	"""Attempt face login using nearest-neighbor search.
+	
+	Requires pgvector extension and public.find_nearest_embeddings function.
+	Returns 501 if pgvector is not available.
+	"""
 	payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+	# Accept either a data URL (`face_image` / `image`) or a storage path (`temp_storage_path` / `temp_path`)
 	data_url = payload.get('face_image') or payload.get('image')
-	if not data_url:
+	temp_path = payload.get('temp_storage_path') or payload.get('temp_path')
+	storage_path = None
+	public_url = None
+
+	if not data_url and not temp_path:
 		return jsonify({'ok': False, 'error': 'missing_image'}), 400
-	# Accept data URL, HTTP(S) URL, or storage path
+	# Accept temp storage path, data URL, HTTP(S) URL, or storage path.
 	try:
-		if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
-			import requests
-			resp = requests.get(data_url, timeout=20)
-			resp.raise_for_status()
-			img_bytes = resp.content
-			img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+		if temp_path:
+			# download the provided storage object and reuse its path (do NOT re-upload)
+			raw = download_from_storage(temp_path)
+			img_bytes = raw
+			from PIL import Image as PILImage
+			img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
 			img_arr = np.array(img)
-		elif isinstance(data_url, str) and data_url.startswith('data:'):
-			img_arr, _ = decode_base64_image(data_url)
+			storage_path = temp_path.lstrip('/')
+			public_url = _public_or_signed_url(storage_path) or storage_path
 		else:
-			fetched = False
-			if sb and SUPABASE_BUCKET:
-				try:
-					pub = _public_or_signed_url(data_url)
-					if pub:
-						import requests
-						r = requests.get(pub, timeout=20)
-						r.raise_for_status()
-						img_bytes = r.content
+			# If data_url is an HTTP(S) URL, fetch it. If it's a data URL, decode locally.
+			if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
+				import requests
+				rep = requests.get(data_url, timeout=20)
+				rep.raise_for_status()
+				img_bytes = rep.content
+				img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+				img_arr = np.array(img)
+			elif isinstance(data_url, str) and data_url.startswith('data:'):
+				img_arr, img_bytes = decode_base64_image(data_url)
+			else:
+				# treat as storage path: prefer resolving a public URL and fetching
+				fetched = False
+				if sb and SUPABASE_BUCKET:
+					try:
+						pub = _public_or_signed_url(data_url)
+						if pub:
+							import requests
+							r = requests.get(pub, timeout=20)
+							r.raise_for_status()
+							img_bytes = r.content
+							img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+							img_arr = np.array(img)
+							fetched = True
+					except Exception:
+						fetched = False
+				if not fetched:
+					try:
+						raw = download_from_storage(data_url)
+						img_bytes = raw
 						img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
 						img_arr = np.array(img)
-						fetched = True
-				except Exception:
-					fetched = False
-			if not fetched:
-				try:
-					raw = download_from_storage(data_url)
-					img_bytes = raw
-					img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-					img_arr = np.array(img)
-				except Exception:
-					img_arr, _ = decode_base64_image(data_url)
+					except Exception:
+						# As a last resort, attempt to decode as data URL
+						img_arr, img_bytes = decode_base64_image(data_url)
+			# When not using temp_path, do not set storage_path/public_url here
+			if not temp_path:
+				storage_path = None
+				public_url = None
 	except Exception as exc:
 		return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
 
@@ -963,53 +1095,102 @@ def api_login_face():
 	if encoding is None:
 		return jsonify({'ok': False, 'error': 'no_face', 'message': 'No face detected. Ensure good lighting, clear focus on face, and try again.'}), 200
 
+	# Check if pgvector is available - required for nearest-neighbor lookup
+	use_vector = _detect_vector_type()
+	if not use_vector:
+		return jsonify({
+			'ok': False,
+			'error': 'nearest_embeddings_not_supported',
+			'detail': 'pgvector extension required for login_face. Enable pgvector in your Postgres database.'
+		}), 501
+
 	threshold = float(payload.get('threshold') or 0.5)
 	limit = int(payload.get('limit') or 1)
-	# Nearest-embedding lookup requires the pgvector `vector` type and
-	# a DB-side function such as `public.find_nearest_embeddings`. If the
-	# database does not have pgvector installed, fail early with a helpful
-	# error so callers know to enable the extension or provide an alternative.
-	if not _detect_vector_type():
-		return jsonify({'ok': False, 'error': 'nearest_embeddings_not_supported', 'detail': 'pgvector extension / vector type is not available in the database'}), 501
 
 	conn = get_db_conn()
 	cur = conn.cursor()
 	try:
-		vec_literal = 'ARRAY[' + ','.join(repr(float(x)) for x in encoding) + ']::vector_ext.vector'
-		# Call the DB helper with the requested `limit` and then apply the
-		# distance threshold in Python. This avoids relying on a second
-		# parameter in the DB function being used as a threshold.
+		# Use pgvector nearest-neighbor function
+		# Build the vector literal directly into SQL (safe because encoding is numeric list)
+		vec_vals = ','.join(str(float(x)) for x in encoding)
+		# Use schema-qualified vector type to avoid relying on connection search_path
+		# (the extension may be installed in vector_ext schema).
 		sql = f"""
 			SELECT embedding_id, user_id, dist
-			FROM public.find_nearest_embeddings({vec_literal}, %s)
+			FROM public.find_nearest_embeddings(ARRAY[{vec_vals}]::vector_ext.vector(128), %s)
 		"""
-		cur.execute(sql, (limit,))
+		try:
+			cur.execute(sql, (limit,))
+		except Exception as db_exc:
+			# Detect missing pgvector type/errors and return a helpful 501
+			msg = str(db_exc).lower()
+			if 'type "vector" does not exist' in msg or 'pgvector' in msg or 'vector' in msg and 'does not exist' in msg:
+				app.logger.exception('login_face: vector type missing')
+				return jsonify({
+					'ok': False,
+					'error': 'nearest_embeddings_not_supported',
+					'detail': 'pgvector extension or vector type not available in DB. Install/enable pgvector and create the helper function find_nearest_embeddings.'
+				}), 501
+			raise
 		row = cur.fetchone()
 		if not row:
 			conn.commit()
+			cur.close()
+			conn.close()
 			return jsonify({'ok': False, 'error': 'no_match'}), 200
+
 		_, user_id, dist = row
-		# dist is returned as double precision; ensure it's compared to the
-		# caller-provided threshold (lower is closer for L2 distance)
 		if dist is None or float(dist) > threshold:
 			conn.commit()
+			cur.close()
+			conn.close()
 			return jsonify({'ok': False, 'error': 'no_match', 'min_distance': float(dist) if dist is not None else None}), 200
-		cur.execute('SELECT id, display_name, username FROM public.users WHERE id = %s', (user_id,))
+
+		cur.execute('SELECT id, display_name, username, email FROM public.users WHERE id = %s', (user_id,))
 		user_row = cur.fetchone()
 		conn.commit()
 	except Exception as exc:
-		conn.rollback()
+		try:
+			conn.rollback()
+		except Exception:
+			pass
 		app.logger.exception('login_face: db error')
+		# Check if error is due to missing find_nearest_embeddings function
+		if 'find_nearest_embeddings' in str(exc) or 'does not exist' in str(exc):
+			return jsonify({
+				'ok': False,
+				'error': 'nearest_embeddings_not_supported',
+				'detail': 'DB function find_nearest_embeddings not found. Create it using the SQL provided in supabase_setup.sql.'
+			}), 501
 		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 	finally:
-		cur.close()
-		conn.close()
+		try:
+			cur.close()
+		except Exception:
+			pass
+		try:
+			conn.close()
+		except Exception:
+			pass
 
 	if not user_row:
 		return jsonify({'ok': False, 'error': 'user_missing'}), 404
-	if dist > threshold:
-		return jsonify({'ok': False, 'error': 'no_match', 'min_distance': float(dist)}), 200
-	return jsonify({'ok': True, 'user': {'id': str(user_row[0]), 'display_name': user_row[1], 'username': user_row[2]}, 'distance': float(dist)}), 200
+
+	# Return storage info if we had a provided temp path
+	resp = {
+		'ok': True,
+		'user': {
+			'id': str(user_row[0]),
+			'display_name': user_row[1],
+			'username': user_row[2],
+			'email': user_row[3]
+		},
+		'distance': float(dist)
+	}
+	if storage_path:
+		resp['storage_path'] = storage_path
+		resp['public_url'] = public_url
+	return jsonify(resp), 200
 
 
 @app.route('/api/admin/embeddings', methods=['GET'])
