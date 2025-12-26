@@ -264,7 +264,7 @@ def compute_face_encoding(img_arr):
 		import face_recognition
 	except Exception as exc:
 		app.logger.warning('face_recognition not available: %s', str(exc))
-		return None
+		return None     
 	# Log image details for debugging
 	app.logger.debug('face detection: image shape %s, dtype %s', img_arr.shape, img_arr.dtype)
 	print(f'compute_face_encoding: image shape={getattr(img_arr, "shape", None)}', flush=True)
