@@ -270,6 +270,7 @@ def compute_face_encoding(img_arr):
 	print(f'compute_face_encoding: image shape={getattr(img_arr, "shape", None)}', flush=True)
 	# Fast path: prefer the lightweight `hog` detector with minimal upsampling
 	# and low jitter for encoding. If hog finds no faces, fall back to cnn.
+	
 	locations = []
 	try:
 		locations = face_recognition.face_locations(img_arr, model='hog', number_of_times_to_upsample=0)
