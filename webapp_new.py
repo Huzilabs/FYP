@@ -45,6 +45,28 @@ handler.setFormatter(formatter)
 app.logger.addHandler(handler)
 app.logger.setLevel(logging.DEBUG)
 
+
+@app.before_request
+def _handle_cors_preflight():
+	"""Handle CORS preflight OPTIONS requests."""
+	if request.method == 'OPTIONS':
+		response = jsonify({'ok': True})
+		response.status_code = 200
+		return _set_cors_headers(response)
+
+
+@app.after_request
+def _set_cors_headers(response):
+	"""Add CORS headers to all responses for localhost:3000."""
+	origin = request.headers.get('Origin', '')
+	if 'localhost:3000' in origin or origin == 'http://localhost:3000':
+		response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+		response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS,HEAD'
+		response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,X-User-Id'
+		response.headers['Access-Control-Allow-Credentials'] = 'true'
+		response.headers['Access-Control-Max-Age'] = '3600'
+	return response
+
 # Cache whether pgvector `vector` type exists to avoid repeated checks
 _HAS_VECTOR = None
 
@@ -237,10 +259,12 @@ def download_from_storage(path: str) -> bytes:
 
 
 def compute_face_encoding(img_arr):
+	"""Compute face encoding. Returns None if face_recognition unavailable or no face detected."""
 	try:
 		import face_recognition
 	except Exception as exc:
-		raise RuntimeError('face_recognition import failed: ' + str(exc))
+		app.logger.warning('face_recognition not available: %s', str(exc))
+		return None
 	# Log image details for debugging
 	app.logger.debug('face detection: image shape %s, dtype %s', img_arr.shape, img_arr.dtype)
 	print(f'compute_face_encoding: image shape={getattr(img_arr, "shape", None)}', flush=True)
@@ -376,7 +400,11 @@ def api_detect_face():
 	try:
 		import face_recognition
 	except Exception as exc:
-		return jsonify({'ok': False, 'error': 'face_recognition_failed', 'detail': str(exc)}), 500
+		return jsonify({
+			'ok': False,
+			'error': 'face_recognition_unavailable',
+			'detail': 'face_recognition library not installed. Image upload still works but face detection disabled.'
+		}), 501
 
 	locations = face_recognition.face_locations(img_arr, model='large', number_of_times_to_upsample=2)
 	faces = [{'top': t, 'right': r, 'bottom': b, 'left': l} for t, r, b, l in locations]
@@ -446,9 +474,10 @@ def api_capture_face():
 
 	save_debug_image('capture', img_arr)
 
+	# Try to compute encoding, but allow capture even if face_recognition unavailable
 	encoding = compute_face_encoding(img_arr)
 	if encoding is None:
-		return jsonify({'ok': False, 'error': 'no_face', 'message': 'No face detected. Ensure good lighting, clear focus on face, and try again.'}), 200
+		app.logger.warning('capture_face: no encoding computed (face_recognition unavailable or no face detected)')
 
 	try:
 		ensure_storage_ready()
@@ -509,7 +538,12 @@ def api_capture_face():
 			),
 		)
 
-		insert_embedding(cur, user_id, encoding, 'capture')
+		# Insert embedding only if we have one
+		if encoding is not None:
+			try:
+				insert_embedding(cur, user_id, encoding, 'capture')
+			except Exception:
+				app.logger.exception('capture_face: embedding insert failed, continuing')
 		conn.commit()
 	except Exception as exc:
 		conn.rollback()
@@ -671,9 +705,17 @@ def api_register():
 						len(img_bytes),
 					),
 				)
+				# Try to compute encoding and insert embedding separately
+				# This is optional - registration succeeds even without face encoding
 				encoding = compute_face_encoding(img_arr)
 				if encoding is not None:
-					insert_embedding(cur, user_id, encoding, 'register')
+					try:
+						insert_embedding(cur, user_id, encoding, 'register')
+						app.logger.info('register: embedding inserted successfully')
+					except Exception:
+						app.logger.warning('register: failed to insert embedding, continuing')
+				else:
+					app.logger.warning('register: no encoding computed (face_recognition unavailable or no face)')
 				conn.commit()
 			except Exception as exc:
 				conn.rollback()
@@ -761,6 +803,7 @@ def api_attach_image():
 				pass
 
 		# Try to compute encoding and insert embedding separately
+		# This is optional - image attachment succeeds even without face encoding
 		try:
 			encoding = compute_face_encoding(img_arr)
 			if encoding is not None:
@@ -769,20 +812,23 @@ def api_attach_image():
 				try:
 					insert_embedding(emb_cur, user_id, encoding, 'attach')
 					emb_conn.commit()
+					app.logger.info('attach_image: embedding inserted successfully')
 				except Exception:
 					try:
 						emb_conn.rollback()
 					except Exception:
 						pass
-					app.logger.exception('attach_image: failed to insert embedding')
+					app.logger.warning('attach_image: failed to insert embedding, continuing')
 				finally:
 					try:
 						emb_cur.close()
 						emb_conn.close()
 					except Exception:
 						pass
+			else:
+				app.logger.warning('attach_image: no encoding computed (face_recognition unavailable or no face)')
 		except Exception:
-			app.logger.exception('attach_image: encoding failed')
+			app.logger.warning('attach_image: encoding computation failed, continuing without embedding')
 
 		return jsonify({'ok': True, 'storage_path': storage_path, 'public_url': public_url}), 201
 	except Exception as exc:
@@ -792,6 +838,11 @@ def api_attach_image():
 
 @app.route('/api/login_face', methods=['POST'])
 def api_login_face():
+	"""Attempt face login using nearest-neighbor search.
+	
+	Requires pgvector extension and public.find_nearest_embeddings function.
+	Returns 501 if pgvector is not available.
+	"""
 	payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
 	data_url = payload.get('face_image') or payload.get('image')
 	if not data_url:
@@ -805,53 +856,81 @@ def api_login_face():
 	if encoding is None:
 		return jsonify({'ok': False, 'error': 'no_face', 'message': 'No face detected. Ensure good lighting, clear focus on face, and try again.'}), 200
 
+	# Check if pgvector is available - required for nearest-neighbor lookup
+	use_vector = _detect_vector_type()
+	if not use_vector:
+		return jsonify({
+			'ok': False,
+			'error': 'nearest_embeddings_not_supported',
+			'detail': 'pgvector extension required for login_face. Enable pgvector in your Postgres database.'
+		}), 501
+
 	threshold = float(payload.get('threshold') or 0.5)
 	limit = int(payload.get('limit') or 1)
-	# Nearest-embedding lookup requires the pgvector `vector` type and
-	# a DB-side function such as `public.find_nearest_embeddings`. If the
-	# database does not have pgvector installed, fail early with a helpful
-	# error so callers know to enable the extension or provide an alternative.
-	if not _detect_vector_type():
-		return jsonify({'ok': False, 'error': 'nearest_embeddings_not_supported', 'detail': 'pgvector extension / vector type is not available in the database'}), 501
 
 	conn = get_db_conn()
 	cur = conn.cursor()
 	try:
-		vec_literal = 'ARRAY[' + ','.join(repr(float(x)) for x in encoding) + ']::vector_ext.vector'
-		# Call the DB helper with the requested `limit` and then apply the
-		# distance threshold in Python. This avoids relying on a second
-		# parameter in the DB function being used as a threshold.
-		sql = f"""
+		# Use pgvector nearest-neighbor function
+		vec_literal = 'ARRAY[' + ','.join(repr(float(x)) for x in encoding) + ']::vector'
+		sql = """
 			SELECT embedding_id, user_id, dist
-			FROM public.find_nearest_embeddings({vec_literal}, %s)
+			FROM public.find_nearest_embeddings(%s::vector, %s)
 		"""
-		cur.execute(sql, (limit,))
+		cur.execute(sql, (vec_literal, limit))
 		row = cur.fetchone()
 		if not row:
 			conn.commit()
+			cur.close()
+			conn.close()
 			return jsonify({'ok': False, 'error': 'no_match'}), 200
+		
 		_, user_id, dist = row
-		# dist is returned as double precision; ensure it's compared to the
-		# caller-provided threshold (lower is closer for L2 distance)
 		if dist is None or float(dist) > threshold:
 			conn.commit()
+			cur.close()
+			conn.close()
 			return jsonify({'ok': False, 'error': 'no_match', 'min_distance': float(dist) if dist is not None else None}), 200
-		cur.execute('SELECT id, display_name, username FROM public.users WHERE id = %s', (user_id,))
+		
+		cur.execute('SELECT id, display_name, username, email FROM public.users WHERE id = %s', (user_id,))
 		user_row = cur.fetchone()
 		conn.commit()
 	except Exception as exc:
-		conn.rollback()
+		try:
+			conn.rollback()
+		except Exception:
+			pass
 		app.logger.exception('login_face: db error')
+		# Check if error is due to missing find_nearest_embeddings function
+		if 'find_nearest_embeddings' in str(exc) or 'does not exist' in str(exc):
+			return jsonify({
+				'ok': False,
+				'error': 'nearest_embeddings_not_supported',
+				'detail': 'DB function find_nearest_embeddings not found. Create it using the SQL provided in supabase_setup.sql.'
+			}), 501
 		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 	finally:
-		cur.close()
-		conn.close()
+		try:
+			cur.close()
+		except Exception:
+			pass
+		try:
+			conn.close()
+		except Exception:
+			pass
 
 	if not user_row:
 		return jsonify({'ok': False, 'error': 'user_missing'}), 404
-	if dist > threshold:
-		return jsonify({'ok': False, 'error': 'no_match', 'min_distance': float(dist)}), 200
-	return jsonify({'ok': True, 'user': {'id': str(user_row[0]), 'display_name': user_row[1], 'username': user_row[2]}, 'distance': float(dist)}), 200
+	
+	return jsonify({
+		'ok': True,
+		'user': {
+			'id': str(user_row[0]),
+			'display_name': user_row[1],
+			'username': user_row[2]
+		},
+		'distance': float(dist)
+	}), 200
 
 
 @app.route('/api/admin/embeddings', methods=['GET'])
