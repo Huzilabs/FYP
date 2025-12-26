@@ -72,16 +72,21 @@ All endpoints are under `/api/` except the legacy `/signup` form endpoint.
   - Important: nearest-neighbor lookup requires pgvector / `vector` type and a DB helper `public.find_nearest_embeddings`. If your Postgres does not have pgvector installed, the endpoint will return a helpful error `{error: 'nearest_embeddings_not_supported'}` with status 501. The server supports float8[] storage of embeddings, but efficient nearest lookups require pgvector.
   - On success: returns `{ok:true, user: {id, display_name, username}, distance}` where `distance` is the L2 distance (lower is closer). If no match within the provided `threshold`, the endpoint returns a no-match response.
 
+- `GET /api/admin/embeddings?user_id=<id>`
   - Purpose: debug helper to list embedding metadata for a user. Intended for local testing only (not secured).
 
 ## Owner-only CRUD behavior
 
+- For safety, the server enforces a minimal owner check on user/image CRUD endpoints. The frontend must provide the logged-in user's id (the actor) with each request that modifies or reads user-private data.
+- How to pass the actor id:
   - Preferred: set HTTP header `X-User-Id: <user_id>` on the request.
   - Alternative: include `actor_user_id` (or `user_id`) in the JSON body or form data.
+- Endpoints protected by this check:
   - `GET /api/users/<user_id>` — returns user details only if actor matches `user_id`.
   - `PUT /api/users/<user_id>` — updates user fields only if actor matches `user_id`.
   - `DELETE /api/users/<user_id>` — deletes user and related data only if actor matches `user_id`.
   - `DELETE /api/user_images/<image_id>` — deletes image only if the actor is the owner of that image.
+- Example (curl):
 
 ```bash
 curl -H "Content-Type: application/json" -H "X-User-Id: <USER_ID>" \
@@ -90,7 +95,6 @@ curl -H "Content-Type: application/json" -H "X-User-Id: <USER_ID>" \
 ```
 
 Security note: this header-based check is a minimal convenience for local or trusted frontends. For production, replace with proper authentication (JWT, Supabase auth, or API keys) and validate tokens server-side before authorizing CRUD operations.
-
 
 ## Data model & CRUD notes
 

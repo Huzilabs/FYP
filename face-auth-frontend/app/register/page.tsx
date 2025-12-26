@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { register, RegisterData } from '@/lib/api';
 import CameraCapture from '@/components/CameraCapture';
-import { supabase } from '@/lib/supabaseClient';
+import getSupabaseClient from '@/lib/supabaseClient';
 
 export default function RegisterPage() {
   const [step, setStep] = useState<'form' | 'camera' | 'success'>('form');
@@ -79,10 +79,13 @@ export default function RegisterPage() {
 
     try {
       // Upload captured image to Supabase Storage under face_oftheusers/Registration/
+      let response: any = null;
       try {
         const res = await fetch(capturedImage);
         const blob = await res.blob();
         const filename = `Registration/${Date.now()}_${Math.random().toString(36).slice(2,10)}.jpg`;
+        // create supabase client at runtime
+        const supabase = getSupabaseClient();
         const { data, error: uploadError } = await supabase.storage
           .from('face_oftheusers')
           .upload(filename, blob, { contentType: 'image/jpeg' });
@@ -90,48 +93,30 @@ export default function RegisterPage() {
         if (uploadError) {
           // fallback: send base64 image directly to backend
           console.warn('Supabase upload failed, falling back to direct upload', uploadError);
-          const response = await register({
+          response = await register({
             ...formData,
             face_image: capturedImage,
           });
-          if (response.ok && response.user_id) {
-            setUserId(response.user_id);
-            setStep('success');
-          } else {
-            setError(response.error || 'Registration failed');
-          }
         } else {
           // On success, send storage path as temp_storage_path to backend
-          const response = await register({
+          response = await register({
             ...formData,
             temp_storage_path: filename,
           });
-          if (response.ok && response.user_id) {
-            setUserId(response.user_id);
-            setStep('success');
-          } else {
-            setError(response.error || 'Registration failed');
-          }
         }
       } catch (uploadErr: any) {
         console.warn('Upload attempt threw, falling back to direct upload', uploadErr);
-        const response = await register({
+        response = await register({
           ...formData,
           face_image: capturedImage,
         });
-        if (response.ok && response.user_id) {
-          setUserId(response.user_id);
-          setStep('success');
-        } else {
-          setError(response.error || 'Registration failed');
-        }
       }
-      
-      if (response.ok && response.user_id) {
+
+      if (response && response.ok && response.user_id) {
         setUserId(response.user_id);
         setStep('success');
       } else {
-        setError(response.error || 'Registration failed');
+        setError((response && response.error) || 'Registration failed');
       }
     } catch (err: any) {
       setError(`Error: ${err?.message || err}`);

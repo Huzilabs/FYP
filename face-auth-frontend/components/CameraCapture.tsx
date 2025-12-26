@@ -20,10 +20,21 @@ export default function CameraCapture({ onCapture, onError }: CameraCaptureProps
       });
       
       if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.play();
-        setStreaming(true);
-        setError('');
+        const video = videoRef.current;
+        // attach stream and wait for metadata before playing to avoid interrupted play() calls
+        video.srcObject = stream;
+        video.muted = true; // mute to allow autoplay in some browsers
+        video.onloadedmetadata = () => {
+          // attempt to play, ignore promise rejection (may be interrupted by navigation)
+          const p = video.play();
+          if (p && typeof p.then === 'function') {
+            p.catch(() => {
+              /* ignore play abort errors */
+            });
+          }
+          setStreaming(true);
+          setError('');
+        };
       }
     } catch (err: any) {
       const errorMsg = `Camera access denied: ${err.message}`;
@@ -34,9 +45,12 @@ export default function CameraCapture({ onCapture, onError }: CameraCaptureProps
 
   const stopCamera = useCallback(() => {
     if (videoRef.current?.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
+      const video = videoRef.current;
+      const stream = video.srcObject as MediaStream;
       stream.getTracks().forEach(track => track.stop());
-      videoRef.current.srcObject = null;
+      // cleanup
+      try { video.onloadedmetadata = null; } catch (e) {}
+      video.srcObject = null;
       setStreaming(false);
     }
   }, []);

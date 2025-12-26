@@ -1,7 +1,8 @@
 'use client';
 
 import { useState } from 'react';
-import { loginFace } from '@/lib/api';
+import { loginFace, uploadFaceTemp } from '@/lib/api';
+import getSupabaseClient from '@/lib/supabaseClient';
 import CameraCapture from '@/components/CameraCapture';
 import Image from 'next/image';
 
@@ -28,9 +29,46 @@ export default function LoginPage() {
     setResult(null);
 
     try {
-      const response = await loginFace(capturedImage);
-      
-      if (response.ok && response.user) {
+      // Upload captured image to Supabase under Login/ and pass temp_storage_path to backend
+      const client = getSupabaseClient();
+      // convert data URL to blob
+      const res = await fetch(capturedImage);
+      const blob = await res.blob();
+      const filename = `Login/${crypto.randomUUID()}.jpg`;
+      let response: any = null;
+      try {
+        const { error: uploadError } = await client.storage.from('face_oftheusers').upload(filename, blob);
+        if (uploadError) {
+          appLogger?.warn?.('Supabase upload error', uploadError);
+          // Try server-side temp upload endpoint before falling back to direct data URL
+          const tempResp = await uploadFaceTemp(capturedImage);
+          if (tempResp && tempResp.ok && tempResp.temp_storage_path) {
+            response = await loginFace(undefined, tempResp.temp_storage_path);
+          } else {
+            // Last-resort: send the data URL directly to loginFace
+            response = await loginFace(capturedImage);
+          }
+        } else {
+          // Call backend with storage path
+          response = await loginFace(undefined, filename);
+        }
+      } catch (uploadEx: any) {
+        // If any unexpected upload error, fall back to server-side upload then direct call
+        console.warn('Upload attempt threw, falling back to server-side upload', uploadEx);
+        try {
+          const tempResp = await uploadFaceTemp(capturedImage);
+          if (tempResp && tempResp.ok && tempResp.temp_storage_path) {
+            response = await loginFace(undefined, tempResp.temp_storage_path);
+          } else {
+            response = await loginFace(capturedImage);
+          }
+        } catch (e: any) {
+          setError('Upload failed: ' + (e?.message || String(e)));
+          setLoading(false);
+          return;
+        }
+      }
+      if (response && response.ok && response.user) {
         setResult({
           success: true,
           user: response.user,

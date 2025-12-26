@@ -62,7 +62,7 @@ export const uploadFaceTemp = async (imageDataUrl: string): Promise<ApiResponse>
 export const captureFace = async (imageDataUrl: string, userId?: string): Promise<ApiResponse> => {
   const body: any = { face_image: imageDataUrl };
   if (userId) body.user_id = userId;
-  
+
   const response = await fetch(`${API_URL}/api/capture_face`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -102,7 +102,7 @@ export const attachImage = async (userId: string, imageDataUrl?: string, tempPat
   const body: any = { user_id: userId };
   if (imageDataUrl) body.face_image = imageDataUrl;
   if (tempPath) body.temp_storage_path = tempPath;
-  
+
   const response = await fetch(`${API_URL}/api/attach_image`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -113,14 +113,20 @@ export const attachImage = async (userId: string, imageDataUrl?: string, tempPat
 
 // POST /api/login_face
 export const loginFace = async (
-  imageDataUrl: string,
+  // either pass a data URL as `imageDataUrl` OR a storage path as `tempStoragePath`
+  imageDataUrl?: string,
+  tempStoragePath?: string,
   threshold: number = 0.5,
   limit: number = 1
 ): Promise<ApiResponse<{ user: User; distance: number }>> => {
+  const body: any = { threshold, limit };
+  if (tempStoragePath) body.temp_storage_path = tempStoragePath;
+  else if (imageDataUrl) body.face_image = imageDataUrl;
+
   const response = await fetch(`${API_URL}/api/login_face`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ face_image: imageDataUrl, threshold, limit }),
+    body: JSON.stringify(body),
   });
   return response.json();
 };
