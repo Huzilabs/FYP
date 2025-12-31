@@ -18,6 +18,7 @@ SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_SERVICE_ROLE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
 SUPABASE_DB_URL = os.getenv('SUPABASE_DB_URL') or os.getenv('DATABASE_URL')
 SUPABASE_BUCKET = os.getenv('SUPABASE_BUCKET')
+SUPABASE_BUCKET = os.getenv('SUPABASE_BUCKET')
 
 sb = None
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
@@ -99,6 +100,46 @@ def _detect_vector_type() -> bool:
 	return _HAS_VECTOR
 
 
+# Cache the schema name that contains the `vector` type (pgvector)
+_VECTOR_SCHEMA = None
+
+
+def _detect_vector_schema() -> Optional[str]:
+	"""Return the schema name that contains the `vector` type, or None if not found.
+
+	This is used to construct schema-qualified casts like `schema.vector(128)` when
+	the extension is installed into a non-public schema (e.g. `vector_ext`).
+	The result is cached in `_VECTOR_SCHEMA` but will be rechecked if None.
+	"""
+	global _VECTOR_SCHEMA
+	if _VECTOR_SCHEMA is not None:
+		return _VECTOR_SCHEMA
+	try:
+		conn = get_db_conn()
+		cur = conn.cursor()
+		# Find the namespace (schema) that defines a type named 'vector'
+		cur.execute("""
+			SELECT n.nspname
+			FROM pg_type t
+			JOIN pg_namespace n ON t.typnamespace = n.oid
+			WHERE t.typname = 'vector'
+			LIMIT 1
+		""")
+		row = cur.fetchone()
+		cur.close()
+		try:
+			conn.close()
+		except Exception:
+			pass
+		if row and row[0]:
+			_VECTOR_SCHEMA = row[0]
+			return _VECTOR_SCHEMA
+	except Exception:
+		app.logger.debug('could not detect vector schema')
+	_VECTOR_SCHEMA = None
+	return None
+
+
 def coerce_bool(value: Optional[str]) -> bool:
 	if isinstance(value, bool):
 		return value
@@ -140,7 +181,27 @@ def get_db_conn():
 		import psycopg2  # type: ignore
 	except Exception as exc:
 		raise RuntimeError('psycopg2 is required: ' + str(exc))
-	conn = psycopg2.connect(SUPABASE_DB_URL)
+	# Make a local copy so we can safely modify for SSL fallback and logging
+	dsn = SUPABASE_DB_URL
+	try:
+		import re
+		masked = re.sub(r'://([^:]+):[^@]+@', r'://\\1:****@', dsn)
+	except Exception:
+		masked = '<masked unavailable>'
+	app.logger.info('Attempting DB connect using %s', masked)
+
+	# Ensure SSL is used when missing (Supabase requires SSL)
+	try:
+		if 'sslmode' not in (dsn or '').lower():
+			if '?' in dsn:
+				dsn = dsn + '&sslmode=require'
+			else:
+				dsn = dsn + '?sslmode=require'
+			app.logger.debug('Appended sslmode=require to DSN for connection')
+	except Exception:
+		pass
+
+	conn = psycopg2.connect(dsn)
 	conn.autocommit = False
 	# Ensure pgvector types in a non-public schema (e.g. vector_ext) are visible
 	# by preferring that schema in the search_path. This lets casts like ::vector
@@ -1113,14 +1174,26 @@ def api_login_face():
 		# Use pgvector nearest-neighbor function
 		# Build the vector literal directly into SQL (safe because encoding is numeric list)
 		vec_vals = ','.join(str(float(x)) for x in encoding)
-		# Use schema-qualified vector type to avoid relying on connection search_path
-		# (the extension may be installed in vector_ext schema).
-		sql = f"""
-			SELECT embedding_id, user_id, dist
-			FROM public.find_nearest_embeddings(ARRAY[{vec_vals}]::vector_ext.vector(128), %s)
+		# Detect which schema contains the `vector` type and build a schema-qualified
+		# type reference. If detection fails, fall back to an unqualified `vector`.
+		v_schema = _detect_vector_schema()
+		if v_schema:
+			type_ref = f"{v_schema}.vector(128)"
+		else:
+			type_ref = "vector(128)"
+		# Prefer calling a helper, but if it's not present, run an inline NN query
+		# that computes distances directly against `public.embeddings`.
+		# This avoids requiring `public.find_nearest_embeddings` to exist.
+		inline_sql = f"""
+			SELECT e.id AS embedding_id, e.user_id, (e.embedding <-> ARRAY[{vec_vals}]::{type_ref}) AS dist
+			FROM public.embeddings e
+			ORDER BY dist
+			LIMIT %s
 		"""
+		# Try inline query first (more self-contained); if it fails due to missing
+		# vector type or operator, fall back to attempting the helper function.
 		try:
-			cur.execute(sql, (limit,))
+			cur.execute(inline_sql, (limit,))
 		except Exception as db_exc:
 			# Detect missing pgvector type/errors and return a helpful 501
 			msg = str(db_exc).lower()

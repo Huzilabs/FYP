@@ -92,11 +92,10 @@ Content-Type: application/json
 - `login_face` requires `pgvector` for nearest-neighbor search. If your Supabase DB does not have pgvector, see `tests/enable_pgvector.py` in the repo.
 - The backend will not write to the database during `detect_face` — detection is read-only.
 
-
-    - Required: `display_name`, `username`, `consent_terms` (true)
-    - Image: `image_url` (HTTP(S) public URL) or `image`/`face_image` (data URL) or a storage path string.
-    - Optional: `email`, `phone`, `date_of_birth`, `emergency_contact`, `medications`, `allergies`, `accessibility_needs`, `preferred_language`, `temp_storage_path` (if you used temporary upload step).
-    - Behavior: server creates/updates `public.users`, saves a `public.user_images` row (uploads image into `user_id/<filename>`), computes face embedding and inserts into `public.embeddings`.
+  - Required: `display_name`, `username`, `consent_terms` (true)
+  - Image: `image_url` (HTTP(S) public URL) or `image`/`face_image` (data URL) or a storage path string.
+  - Optional: `email`, `phone`, `date_of_birth`, `emergency_contact`, `medications`, `allergies`, `accessibility_needs`, `preferred_language`, `temp_storage_path` (if you used temporary upload step).
+  - Behavior: server creates/updates `public.users`, saves a `public.user_images` row (uploads image into `user_id/<filename>`), computes face embedding and inserts into `public.embeddings`.
 
   - `POST /api/login_face`
 
@@ -168,4 +167,6 @@ Content-Type: application/json
 - `login_face` requires `pgvector` for nearest-neighbor search. If your Supabase DB does not have pgvector, see `tests/enable_pgvector.py` in the repo.
 - The backend will not write to the database during `detect_face` — detection is read-only.
 
-````
+```
+
+```
