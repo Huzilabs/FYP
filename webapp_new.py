@@ -6,6 +6,7 @@ import uuid
 from typing import Tuple, Optional
 
 from flask import Flask, jsonify, render_template, request
+from flask_cors import CORS
 from PIL import Image
 from dotenv import load_dotenv
 import logging
@@ -35,6 +36,9 @@ DEBUG_DIR = os.path.join(DATA_DIR, 'debug')
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
 app = Flask(__name__, template_folder='templates')
+# Enable permissive CORS for now to allow frontend/dev access from any origin.
+# In production, restrict origins to your frontend domain(s).
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # Configure logging to stdout so terminal shows logs reliably
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s', force=True)
@@ -60,12 +64,16 @@ def _handle_cors_preflight():
 def _set_cors_headers(response):
 	"""Add CORS headers to all responses for localhost:3000."""
 	origin = request.headers.get('Origin', '')
-	if 'localhost:3000' in origin or origin == 'http://localhost:3000':
-		response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
-		response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS,HEAD'
-		response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,X-User-Id'
-		response.headers['Access-Control-Allow-Credentials'] = 'true'
-		response.headers['Access-Control-Max-Age'] = '3600'
+	# Allow all origins by default (permssive). If you want to restrict to specific
+	# origins in production, check and only set the header for those origins.
+	if origin:
+		response.headers['Access-Control-Allow-Origin'] = origin
+	else:
+		response.headers['Access-Control-Allow-Origin'] = '*'
+	response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS,HEAD'
+	response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,X-User-Id'
+	response.headers['Access-Control-Allow-Credentials'] = 'true'
+	response.headers['Access-Control-Max-Age'] = '3600'
 	return response
 
 # Cache whether pgvector `vector` type exists to avoid repeated checks
@@ -495,6 +503,50 @@ def signup():
 	if tmpl and os.path.exists(page):
 		return render_template('welcome.html')
 	return render_template('index.html') if os.path.exists(os.path.join(tmpl, 'index.html')) else 'Signup'
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+	"""Health endpoint for load balancers and deployment checks.
+
+	Returns JSON with:
+	  - app: basic app liveness
+	  - face_model: whether `face_recognition` is importable and can run a trivial encoding
+	  - db: whether a simple DB query succeeds
+	"""
+	result = {'ok': True, 'app': 'ok', 'face_model': {'available': False}, 'db': {'connected': False}}
+
+	# Check face_recognition availability
+	try:
+		import numpy as _np
+		try:
+			import face_recognition as _fr
+			# run a tiny no-face encoding to ensure libs load (fast)
+			blank = _np.zeros((10, 10, 3), dtype=_np.uint8)
+			encs = _fr.face_encodings(blank)
+			result['face_model'] = {'available': True, 'encodings': len(encs)}
+		except Exception as exc:
+			result['face_model'] = {'available': False, 'detail': str(exc)}
+	except Exception as exc:
+		result['face_model'] = {'available': False, 'detail': 'numpy import failed: ' + str(exc)}
+
+	# Check DB connectivity
+	try:
+		conn = get_db_conn()
+		cur = conn.cursor()
+		cur.execute('SELECT 1')
+		_ = cur.fetchone()
+		cur.close()
+		try:
+			conn.close()
+		except Exception:
+			pass
+		result['db'] = {'connected': True}
+	except Exception as exc:
+		result['db'] = {'connected': False, 'detail': str(exc)}
+
+	status_code = 200 if result['db'].get('connected') and result['face_model'].get('available') else 200
+	return jsonify(result), status_code
 
 
 @app.route('/api/detect_face', methods=['POST'])
