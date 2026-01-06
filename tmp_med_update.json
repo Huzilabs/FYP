@@ -1,0 +1,12 @@
+{
+  "medication": {
+    "dosage": "500mg",
+    "frequency": "daily",
+    "id": "714beb68-88da-4cab-a3ac-42c5c3d7d5e8",
+    "instructions": null,
+    "name": "vitamin C",
+    "time": null,
+    "updated_at": "2026-01-06T22:06:15.581045+00:00"
+  },
+  "ok": true
+}

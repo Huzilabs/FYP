@@ -13,6 +13,9 @@ import logging
 import sys
 import json
 import numpy as np
+import psycopg2
+from psycopg2 import pool as pgpool
+from urllib.parse import urlparse
 
 load_dotenv()
 SUPABASE_URL = os.getenv('SUPABASE_URL')
@@ -77,211 +80,463 @@ def _set_cors_headers(response):
 	return response
 
 # Cache whether pgvector `vector` type exists to avoid repeated checks
+
 _HAS_VECTOR = None
 
-
-def _detect_vector_type() -> bool:
-	global _HAS_VECTOR
-	# If we've previously determined pgvector exists, return cached True immediately.
-	if _HAS_VECTOR is True:
-		return True
-	# Otherwise, re-check the DB (this allows a prior False cache to be re-evaluated
-	# after migrations or admin changes).
-	try:
-		conn = None
-		try:
-			conn = get_db_conn()
-			cur = conn.cursor()
-			# Check both pg_extension (installation) and pg_type (type existence with schema)
-			cur.execute("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector') OR EXISTS(SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'vector')")
-			_HAS_VECTOR = bool(cur.fetchone()[0])
-			cur.close()
-		finally:
-			try:
-				if conn:
-					conn.close()
-			except Exception:
-				pass
-	except Exception:
-		app.logger.exception('error detecting pgvector type')
-		_HAS_VECTOR = False
-	return _HAS_VECTOR
-
-
-# Cache the schema name that contains the `vector` type (pgvector)
+# Cache detected vector schema name
 _VECTOR_SCHEMA = None
 
 
 def _detect_vector_schema() -> Optional[str]:
-	"""Return the schema name that contains the `vector` type, or None if not found.
-
-	This is used to construct schema-qualified casts like `schema.vector(128)` when
-	the extension is installed into a non-public schema (e.g. `vector_ext`).
-	The result is cached in `_VECTOR_SCHEMA` but will be rechecked if None.
-	"""
+	"""Return the schema name that defines the `vector` type, or None."""
 	global _VECTOR_SCHEMA
 	if _VECTOR_SCHEMA is not None:
 		return _VECTOR_SCHEMA
 	try:
 		conn = get_db_conn()
 		cur = conn.cursor()
-		# Find the namespace (schema) that defines a type named 'vector'
-		cur.execute("""
-			SELECT n.nspname
-			FROM pg_type t
-			JOIN pg_namespace n ON t.typnamespace = n.oid
-			WHERE t.typname = 'vector'
-			LIMIT 1
-		""")
+		cur.execute("SELECT n.nspname FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'vector' LIMIT 1")
 		row = cur.fetchone()
 		cur.close()
-		try:
-			conn.close()
-		except Exception:
-			pass
+		conn.close()
 		if row and row[0]:
 			_VECTOR_SCHEMA = row[0]
 			return _VECTOR_SCHEMA
 	except Exception:
-		app.logger.debug('could not detect vector schema')
-	_VECTOR_SCHEMA = None
+		pass
 	return None
 
+# Database pool (lazy-initialized)
+_DB_POOL = None
 
-def coerce_bool(value: Optional[str]) -> bool:
-	if isinstance(value, bool):
-		return value
-	if value is None:
+def init_db_pool():
+	global _DB_POOL
+	if _DB_POOL is not None:
+		return
+	if not SUPABASE_DB_URL:
+		return
+	try:
+		maxconn = int(os.getenv('SUPABASE_DB_MAX_CONN', '10'))
+	except Exception:
+		maxconn = 10
+	try:
+		_DB_POOL = pgpool.ThreadedConnectionPool(1, maxconn, dsn=SUPABASE_DB_URL, sslmode=os.getenv('SUPABASE_DB_SSLMODE', 'require'))
+		app.logger.info('Initialized DB pool (maxconn=%d)', maxconn)
+	except Exception:
+		app.logger.exception('init_db_pool failed; falling back to direct connects')
+		_DB_POOL = None
+
+def get_db_conn():
+	"""Return a DB connection. Uses a threaded pool in production, falls back to direct connect."""
+	global _DB_POOL
+	if not SUPABASE_DB_URL:
+		raise RuntimeError('SUPABASE_DB_URL not configured')
+	if _DB_POOL is None:
+		init_db_pool()
+	if _DB_POOL:
+		conn = _DB_POOL.getconn()
+		# make conn.close() return the connection to the pool for callers that call close()
+		def _return_conn(*args, **kwargs):
+			try:
+				_DB_POOL.putconn(conn)
+			except Exception:
+				try:
+					conn.close()
+				except Exception:
+					pass
+		try:
+			conn.close = _return_conn
+		except Exception:
+			pass
+		return conn
+	# fallback: direct connect
+	return psycopg2.connect(dsn=SUPABASE_DB_URL, sslmode=os.getenv('SUPABASE_DB_SSLMODE', 'require'))
+
+
+def _detect_vector_type() -> bool:
+	global _HAS_VECTOR
+	if _HAS_VECTOR is not None:
+		return _HAS_VECTOR
+	try:
+		conn = get_db_conn()
+		cur = conn.cursor()
+		cur.execute("SELECT 1 FROM pg_type WHERE typname = 'vector' LIMIT 1")
+		exists = cur.fetchone() is not None
+		cur.close()
+		conn.close()
+		_HAS_VECTOR = bool(exists)
+	except Exception:
+		_HAS_VECTOR = False
+	return _HAS_VECTOR
+
+
+def coerce_bool(val) -> bool:
+	"""Coerce common truthy/falsy representations to Python bool.
+
+	Accepts booleans, numbers, and strings like 'true', '1', 'yes', 'on'.
+	Returns False for None or unknown/empty strings.
+	"""
+	try:
+		if val is None:
+			return False
+		if isinstance(val, bool):
+			return val
+		if isinstance(val, (int, float)):
+			return bool(val)
+		s = str(val).strip().lower()
+		if not s:
+			return False
+		return s in ('1', 'true', 't', 'yes', 'y', 'on')
+	except Exception:
 		return False
-	return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def save_debug_image(tag: str, img_arr) -> None:
+	"""Save a small debug JPEG of `img_arr` into the debug folder.
+
+	Non-fatal: logs exceptions and returns silently on failure.
+	"""
+	try:
+		if img_arr is None:
+			return
+		# Ensure debug dir exists
+		os.makedirs(DEBUG_DIR, exist_ok=True)
+		fname = f"{int(time.time())}_{tag}_{uuid.uuid4().hex}.jpg"
+		path = os.path.join(DEBUG_DIR, fname)
+		# Convert numpy array to PIL and save
+		from PIL import Image as PILImage
+		im = PILImage.fromarray(img_arr.astype('uint8'))
+		im.save(path, format='JPEG', quality=85)
+		app.logger.debug('save_debug_image: saved %s', path)
+	except Exception:
+		try:
+			app.logger.exception('save_debug_image failed')
+		except Exception:
+			pass
 
 
 def _get_actor_user_id():
-	"""Resolve caller identity for owner-only checks.
+	"""Return the actor user id provided by the caller.
 
-	This accepts either header `X-User-Id` or form/json field `actor_user_id`.
-	It's a minimal protection mechanism intended for local/dev usage until
-	proper authentication is added (JWT / API key / Supabase auth).
+	Checks the `X-User-Id` header first, then JSON/form fields `actor_user_id` or `user_id`.
+	Returns None when not present.
 	"""
-	# Prefer header
 	try:
-		uid = request.headers.get('X-User-Id')
-		if uid:
-			return uid
+		# Header (preferred)
+		h = request.headers.get('X-User-Id') or request.headers.get('x-user-id')
+		if h:
+			return h
+		# JSON body or form
+		try:
+			payload = request.get_json(force=False, silent=True)
+		except Exception:
+			payload = None
+		if payload and isinstance(payload, dict):
+			return payload.get('actor_user_id') or payload.get('user_id')
+		# fallback to form data
+		try:
+			form = request.form.to_dict() if request.form else {}
+			return form.get('actor_user_id') or form.get('user_id')
+		except Exception:
+			return None
 	except Exception:
-		pass
-	# Fall back to body param
-	try:
-		payload = request.get_json(silent=True) if request.is_json else request.form.to_dict()
-		if payload:
-			uid = payload.get('actor_user_id') or payload.get('user_id')
-			if uid:
-				return uid
-	except Exception:
-		pass
-	return None
-
-
-def get_db_conn():
-	if not SUPABASE_DB_URL:
-		raise RuntimeError('SUPABASE_DB_URL not set')
-	try:
-		import psycopg2  # type: ignore
-	except Exception as exc:
-		raise RuntimeError('psycopg2 is required: ' + str(exc))
-	# Make a local copy so we can safely modify for SSL fallback and logging
-	dsn = SUPABASE_DB_URL
-	try:
-		import re
-		masked = re.sub(r'://([^:]+):[^@]+@', r'://\\1:****@', dsn)
-	except Exception:
-		masked = '<masked unavailable>'
-	app.logger.info('Attempting DB connect using %s', masked)
-
-	# Ensure SSL is used when missing (Supabase requires SSL)
-	try:
-		if 'sslmode' not in (dsn or '').lower():
-			if '?' in dsn:
-				dsn = dsn + '&sslmode=require'
-			else:
-				dsn = dsn + '?sslmode=require'
-			app.logger.debug('Appended sslmode=require to DSN for connection')
-	except Exception:
-		pass
-
-	conn = psycopg2.connect(dsn)
-	conn.autocommit = False
-	# Ensure pgvector types in a non-public schema (e.g. vector_ext) are visible
-	# by preferring that schema in the search_path. This lets casts like ::vector
-	# resolve when the extension is installed into `vector_ext`.
-	try:
-		cur = conn.cursor()
-		# prefer vector_ext then public; if schema doesn't exist this is a no-op
-		cur.execute("SET search_path = vector_ext, public;")
-		cur.close()
-	except Exception:
-		# best-effort: if this fails, leave connection as-is and let callers handle errors
-		app.logger.debug('failed to set search_path to include vector_ext')
-	return conn
-
-
-def normalize_public_url(pu) -> str:
-	"""Normalize Supabase storage URL results into a usable string.
-
-	Accepts either a dict response (older/newer SDKs) or a plain string.
-	Strips whitespace and a trailing lone "?" that some SDK calls return.
-	Returns empty string when the value is missing or clearly invalid.
-	"""
-	if pu is None:
-		return ''
-	# If SDK returns a dict, try common keys for public/signed URLs
-	if isinstance(pu, dict):
-		for key in ('publicURL', 'public_url', 'publicUrl', 'signedURL', 'signed_url', 'signedUrl', 'url'):
-			v = pu.get(key)
-			if v:
-				pu = v
-				break
-		else:
-			# fallback to first value
-			values = [v for v in pu.values() if v]
-			pu = values[0] if values else ''
-
-	s = '' if pu is None else str(pu).strip()
-	if not s:
-		return ''
-
-	# Some Supabase responses append a trailing '?' with empty query; remove it.
-	if s.endswith('?'):
-		s = s[:-1].rstrip()
-
-	# Guard against placeholder strings
-	if s.lower() in ('not_found', 'none', 'null', ''):
-		return ''
-
-	return s
-
-
-def decode_base64_image(data_url: str) -> Tuple[np.ndarray, bytes]:
-	if ',' not in data_url:
-		raise ValueError('invalid data URL')
-	_, b64 = data_url.split(',', 1)
-	img_bytes = base64.b64decode(b64)
-	img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-	arr = np.array(img)
-	return arr, img_bytes
-
-
-def save_debug_image(prefix: str, img_arr) -> None:
-	try:
-		name = f"{prefix}_{uuid.uuid4().hex}.jpg"
-		Image.fromarray(img_arr).save(os.path.join(DEBUG_DIR, name))
-	except Exception:
-		app.logger.exception('failed to persist debug image')
+		return None
 
 
 def ensure_storage_ready():
-	if not sb or not SUPABASE_BUCKET:
-		raise RuntimeError('Supabase storage not configured; check SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_BUCKET')
+		"""Ensure Supabase storage client and bucket are configured."""
+		if not sb or not SUPABASE_BUCKET:
+			raise RuntimeError('Supabase storage not configured; check SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_BUCKET')
+
+
+@app.route('/api/users/<user_id>/medications', methods=['GET'])
+def api_list_medications(user_id):
+		"""List medications for a user."""
+		try:
+			conn = get_db_conn()
+			cur = conn.cursor()
+			cur.execute(
+				"SELECT id, name, dosage, frequency, time, instructions, created_at, updated_at FROM public.user_medications WHERE user_id = %s ORDER BY created_at DESC",
+				(user_id,),
+			)
+			rows = cur.fetchall()
+			items = []
+			for r in rows:
+				items.append({
+					'id': str(r[0]),
+					'name': r[1],
+					'dosage': r[2],
+					'frequency': r[3],
+					'time': r[4],
+					'instructions': r[5],
+					'created_at': r[6].isoformat() if getattr(r[6], 'isoformat', None) else str(r[6]),
+					'updated_at': r[7].isoformat() if getattr(r[7], 'isoformat', None) else str(r[7]),
+				})
+			cur.close()
+			conn.close()
+			return jsonify({'ok': True, 'count': len(items), 'items': items}), 200
+		except Exception as exc:
+			app.logger.exception('list_medications: db error')
+			try:
+				cur.close()
+			except Exception:
+				pass
+			try:
+				conn.close()
+			except Exception:
+				pass
+			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+		def normalize_public_url(resp) -> str:
+			"""Normalize various Supabase SDK/storage responses into a public URL string.
+
+			Accepts:
+			- plain string URL
+			- dict returned by Supabase Python/JS SDK (keys like 'publicURL','publicUrl','signedURL','signedUrl')
+			- nested dicts under 'data'
+			Returns empty string when no usable URL found.
+			"""
+			try:
+				if not resp:
+					return ''
+
+
+				def coerce_bool(val) -> bool:
+					"""Coerce common truthy/falsy representations to Python bool.
+
+					Accepts: booleans, numbers, and strings like 'true', '1', 'yes', 'on'.
+					Returns False for None or unknown strings.
+					"""
+					try:
+						if val is None:
+							return False
+						if isinstance(val, bool):
+							return val
+						if isinstance(val, (int, float)):
+							return bool(val)
+						s = str(val).strip().lower()
+						return s in ('1', 'true', 't', 'yes', 'y', 'on')
+					except Exception:
+						return False
+
+
+				def coerce_bool(val) -> bool:
+					"""Coerce a value from form/query/json into a boolean.
+
+					Treats common truthy strings ('true','1','yes','on') and numeric 1 as True.
+					Everything else is False.
+					"""
+					if isinstance(val, bool):
+						return val
+					if val is None:
+						return False
+					if isinstance(val, (int, float)):
+						return bool(val)
+					s = str(val).strip().lower()
+					if not s:
+						return False
+					return s in ('1', 'true', 'yes', 'on')
+				# string directly
+				if isinstance(resp, str):
+					return resp
+				# bytes
+				if isinstance(resp, (bytes, bytearray)):
+					try:
+						s = resp.decode('utf-8')
+						return s if s.startswith('http') else ''
+					except Exception:
+						return ''
+				# dict-like
+				if isinstance(resp, dict):
+					# common keys
+					for key in ('signedURL', 'signedUrl', 'publicURL', 'publicUrl', 'url'):
+						val = resp.get(key)
+						if isinstance(val, str) and val:
+							return val
+					# sometimes SDK wraps result in 'data'
+					data = resp.get('data')
+					if isinstance(data, str) and data.startswith('http'):
+						return data
+					if isinstance(data, dict):
+						for key in ('signedURL', 'signedUrl', 'publicURL', 'publicUrl', 'url'):
+							val = data.get(key)
+							if isinstance(val, str) and val:
+								return val
+					# fallback: sometimes SDK returns {'url': None, 'data': {'publicURL': ...}}
+					# try any string value in the dict
+					for v in resp.values():
+						if isinstance(v, str) and v.startswith('http'):
+							return v
+						if isinstance(v, dict):
+							for vv in v.values():
+								if isinstance(vv, str) and vv.startswith('http'):
+									return vv
+				# fallback to string representation
+				s = str(resp)
+				if s.startswith('http'):
+					return s
+			except Exception:
+				pass
+			return ''
+
+
+@app.route('/api/users/<user_id>/medications', methods=['POST'])
+def api_create_medication(user_id):
+		"""Create a medication record for the user. Owner-only."""
+		actor = _get_actor_user_id()
+		if not actor or str(actor) != str(user_id):
+			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+		payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+		name = payload.get('name') or payload.get('medication_name')
+		if not name:
+			return jsonify({'ok': False, 'error': 'missing_name'}), 400
+		dosage = payload.get('dosage')
+		frequency = payload.get('frequency')
+		time_val = payload.get('time') or payload.get('when')
+		instructions = payload.get('instructions')
+
+		try:
+			conn = get_db_conn()
+			cur = conn.cursor()
+			cur.execute(
+				"INSERT INTO public.user_medications (user_id, name, dosage, frequency, time, instructions) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id, created_at, updated_at",
+				(user_id, name, dosage, frequency, time_val, instructions),
+			)
+			row = cur.fetchone()
+			conn.commit()
+			med = {
+				'id': str(row[0]),
+				'user_id': user_id,
+				'name': name,
+				'dosage': dosage,
+				'frequency': frequency,
+				'time': time_val,
+				'instructions': instructions,
+				'created_at': row[1].isoformat() if getattr(row[1], 'isoformat', None) else str(row[1]),
+				'updated_at': row[2].isoformat() if getattr(row[2], 'isoformat', None) else str(row[2]),
+			}
+			cur.close()
+			conn.close()
+			return jsonify({'ok': True, 'medication': med}), 201
+		except Exception as exc:
+			app.logger.exception('create_medication: db error')
+			try:
+				conn.rollback()
+			except Exception:
+				pass
+			try:
+				cur.close()
+			except Exception:
+				pass
+			try:
+				conn.close()
+			except Exception:
+				pass
+			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+@app.route('/api/users/<user_id>/medications/<med_id>', methods=['PUT'])
+def api_update_medication(user_id, med_id):
+		"""Update a medication record for the user. Owner-only."""
+		actor = _get_actor_user_id()
+		if not actor or str(actor) != str(user_id):
+			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+		payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+		allowed = ['name', 'dosage', 'frequency', 'time', 'instructions']
+		updates = {}
+		for k in allowed:
+			if k in payload:
+				updates[k] = payload.get(k)
+
+		if not updates:
+			return jsonify({'ok': False, 'error': 'no_updates'}), 400
+
+		try:
+			conn = get_db_conn()
+			cur = conn.cursor()
+			set_clauses = []
+			params = []
+			for k, v in updates.items():
+				set_clauses.append(f"{k} = %s")
+				params.append(v)
+			params.extend([med_id, user_id])
+			sql = f"UPDATE public.user_medications SET {', '.join(set_clauses)}, updated_at = now() WHERE id = %s AND user_id = %s RETURNING id, name, dosage, frequency, time, instructions, updated_at"
+			cur.execute(sql, tuple(params))
+			row = cur.fetchone()
+			if not row:
+				conn.rollback()
+				cur.close()
+				conn.close()
+				return jsonify({'ok': False, 'error': 'medication_missing'}), 404
+			conn.commit()
+			med = {
+				'id': str(row[0]),
+				'name': row[1],
+				'dosage': row[2],
+				'frequency': row[3],
+				'time': row[4],
+				'instructions': row[5],
+				'updated_at': row[6].isoformat() if getattr(row[6], 'isoformat', None) else str(row[6]),
+			}
+			cur.close()
+			conn.close()
+			return jsonify({'ok': True, 'medication': med}), 200
+		except Exception as exc:
+			app.logger.exception('update_medication: db error')
+			try:
+				conn.rollback()
+			except Exception:
+				pass
+			try:
+				cur.close()
+			except Exception:
+				pass
+			try:
+				conn.close()
+			except Exception:
+				pass
+			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+@app.route('/api/users/<user_id>/medications/<med_id>', methods=['DELETE'])
+def api_delete_medication(user_id, med_id):
+		"""Delete a medication record for the user. Owner-only."""
+		actor = _get_actor_user_id()
+		if not actor or str(actor) != str(user_id):
+			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+		try:
+			conn = get_db_conn()
+			cur = conn.cursor()
+			cur.execute("DELETE FROM public.user_medications WHERE id = %s AND user_id = %s RETURNING id", (med_id, user_id))
+			row = cur.fetchone()
+			if not row:
+				conn.rollback()
+				cur.close()
+				conn.close()
+				return jsonify({'ok': False, 'error': 'medication_missing'}), 404
+			conn.commit()
+			cur.close()
+			conn.close()
+			return jsonify({'ok': True}), 200
+		except Exception as exc:
+			app.logger.exception('delete_medication: db error')
+			try:
+				conn.rollback()
+			except Exception:
+				pass
+			try:
+				cur.close()
+			except Exception:
+				pass
+			try:
+				conn.close()
+			except Exception:
+				pass
+			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
 def _public_or_signed_url(path: str) -> str:
@@ -505,91 +760,7 @@ def signup():
 	return render_template('index.html') if os.path.exists(os.path.join(tmpl, 'index.html')) else 'Signup'
 
 
-@app.route('/api/users/<user_id>', methods=['GET'])
-def api_get_user(user_id: str):
-	"""Return basic user details + images + embeddings count.
 
-	Note: No authentication on purpose per user's request. Do not use in production as-is.
-	"""
-	try:
-		conn = get_db_conn()
-		try:
-			cur = conn.cursor()
-			# Fetch user row
-			cur.execute(
-				"""
-				SELECT id, display_name, username, email, phone, verified, created_at
-				FROM public.users
-				WHERE id = %s
-				""",
-				(user_id,),
-			)
-			row = cur.fetchone()
-			if not row:
-				cur.close()
-				try:
-					conn.close()
-				except Exception:
-					pass
-				return jsonify({
-					'ok': False,
-					'error': 'not_found',
-					'detail': 'user not found'
-				}), 404
-
-			# Map row to dict
-			user_obj = {
-				'id': row[0],
-				'display_name': row[1],
-				'username': row[2],
-				'email': row[3],
-				'phone': row[4],
-				'verified': row[5],
-				'created_at': row[6].isoformat() if hasattr(row[6], 'isoformat') else row[6],
-			}
-
-			# Images
-			cur.execute(
-				"""
-				SELECT storage_path, public_url, uploaded_at, is_profile, width, height, mime_type
-				FROM public.user_images
-				WHERE user_id = %s
-				ORDER BY uploaded_at DESC
-				""",
-				(user_id,),
-			)
-			images = []
-			for r in cur.fetchall() or []:
-				images.append({
-					'storage_path': r[0],
-					'public_url': r[1],
-					'uploaded_at': r[2].isoformat() if hasattr(r[2], 'isoformat') else r[2],
-					'is_profile': r[3],
-					'width': r[4],
-					'height': r[5],
-					'mime_type': r[6],
-				})
-
-			# Embeddings count
-			cur.execute("SELECT COUNT(*) FROM public.embeddings WHERE user_id = %s", (user_id,))
-			emb_count = int(cur.fetchone()[0])
-
-			cur.close()
-			try:
-				conn.close()
-			except Exception:
-				pass
-
-			return jsonify({'ok': True, 'user': user_obj, 'images': images, 'embeddings_count': emb_count}), 200
-		except Exception:
-			try:
-				conn.close()
-			except Exception:
-				pass
-			raise
-	except Exception as exc:
-		app.logger.exception('api_get_user failed')
-		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
 @app.route('/health', methods=['GET'])
@@ -834,9 +1005,45 @@ def api_capture_face():
 			cur.close()
 			conn.close()
 			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-		finally:
+        
+	@app.route('/api/users/<user_id>/medications/<med_id>', methods=['DELETE'])
+	def api_delete_medication(user_id, med_id):
+		"""Delete a medication record for the user. Owner-only."""
+		actor = _get_actor_user_id()
+		if not actor or str(actor) != str(user_id):
+			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+		try:
+			conn = get_db_conn()
+			cur = conn.cursor()
+			cur.execute("DELETE FROM public.user_medications WHERE id = %s AND user_id = %s RETURNING id", (med_id, user_id))
+			row = cur.fetchone()
+			if not row:
+				conn.rollback()
+				cur.close()
+				conn.close()
+				return jsonify({'ok': False, 'error': 'medication_missing'}), 404
+			conn.commit()
 			cur.close()
 			conn.close()
+			return jsonify({'ok': True}), 200
+		except Exception as exc:
+			app.logger.exception('delete_medication: db error')
+			try:
+				conn.rollback()
+			except Exception:
+				pass
+			try:
+				cur.close()
+			except Exception:
+				pass
+			try:
+				conn.close()
+			except Exception:
+				pass
+			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+	# end nested medication handler (moved to top-level)
 
 	conn = get_db_conn()
 	cur = conn.cursor()
@@ -993,8 +1200,59 @@ def api_register():
 		conn.close()
 
 	# If the client provided an image data URL or temp path, attach it to the user and insert embedding
+	# Also persist provided `medications` into `public.user_medications` table
+	if medications:
+		try:
+			med_conn = get_db_conn()
+			med_cur = med_conn.cursor()
+			for m in medications:
+				name = None
+				dosage = None
+				frequency = None
+				time_of_day = None
+				instructions = None
+				if isinstance(m, str):
+					name = m.strip()
+				elif isinstance(m, dict):
+					name = m.get('name') or m.get('medication') or None
+					dosage = m.get('dosage')
+					frequency = m.get('frequency')
+					time_of_day = m.get('time') or m.get('time_of_day')
+					instructions = m.get('instructions') or m.get('notes')
+				else:
+					# fallback: stringify
+					name = str(m)
+				if not name:
+					continue
+				try:
+					med_cur.execute(
+						"""
+						INSERT INTO public.user_medications (user_id, name, dosage, frequency, time, instructions, created_at, updated_at)
+						VALUES (%s, %s, %s, %s, %s, %s, now(), now())
+						""",
+						(user_id, name, dosage, frequency, time_of_day, instructions),
+					)
+				except Exception:
+					app.logger.exception('register: failed to insert one medication, continuing')
+			med_conn.commit()
+		except Exception:
+			try:
+				med_conn.rollback()
+			except Exception:
+				pass
+			app.logger.exception('register: failed to insert medications')
+		finally:
+			try:
+				med_cur.close()
+				med_conn.close()
+			except Exception:
+				pass
 	image_data_url = payload.get('image') or payload.get('face_image') or payload.get('image_url')
 	temp_path = payload.get('temp_storage_path') or payload.get('temp_path')
+	image_saved = False
+	embedding_saved = False
+	public_url = None
+	storage_path = None
 	if image_data_url or temp_path:
 		try:
 			if image_data_url:
@@ -1058,6 +1316,7 @@ def api_register():
 						len(img_bytes),
 					),
 				)
+				image_saved = True
 				# Try to compute encoding and insert embedding separately
 				# This is optional - registration succeeds even without face encoding
 				encoding = compute_face_encoding(img_arr)
@@ -1065,8 +1324,32 @@ def api_register():
 					try:
 						insert_embedding(cur, user_id, encoding, 'register')
 						app.logger.info('register: embedding inserted successfully')
+						embedding_saved = True
 					except Exception:
-						app.logger.warning('register: failed to insert embedding, continuing')
+						app.logger.exception('register: failed to insert embedding into primary cursor')
+						# fallback: try inserting using a separate connection
+						try:
+							alt_conn = get_db_conn()
+							alt_cur = alt_conn.cursor()
+							try:
+								insert_embedding(alt_cur, user_id, encoding, 'register-fallback')
+								alt_conn.commit()
+								embedding_saved = True
+							except Exception:
+								try:
+									alt_conn.rollback()
+								except Exception:
+									pass
+								app.logger.exception('register: fallback embedding insert failed')
+							finally:
+								try:
+									alt_cur.close()
+									alt_conn.close()
+								except Exception:
+									pass
+						except Exception:
+							# fallback connection creation failed
+							app.logger.exception('register: could not open fallback DB connection for embedding')
 				else:
 					app.logger.warning('register: no encoding computed (face_recognition unavailable or no face)')
 				conn.commit()
@@ -1079,7 +1362,14 @@ def api_register():
 		except Exception:
 			app.logger.exception('register: image handling failed')
 
-	return jsonify({'ok': True, 'user_id': str(user_id), 'display_name': display_name}), 201
+	resp = {'ok': True, 'user_id': str(user_id), 'display_name': display_name}
+	resp['image_saved'] = image_saved
+	if public_url:
+		resp['public_url'] = public_url
+	if storage_path:
+		resp['storage_path'] = storage_path
+	resp['embedding_saved'] = embedding_saved
+	return jsonify(resp), 201
 
 
 # Legacy POST /signup route used by the web client (form POST)
@@ -1670,6 +1960,203 @@ def api_delete_image(image_id):
 		except Exception:
 			pass
 		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+	@app.route('/api/users/<user_id>/medications', methods=['GET'])
+	def api_list_medications(user_id):
+		"""List medications for a user."""
+		try:
+			conn = get_db_conn()
+			cur = conn.cursor()
+			cur.execute(
+				"SELECT id, name, dosage, frequency, time, instructions, created_at, updated_at FROM public.user_medications WHERE user_id = %s ORDER BY created_at DESC",
+				(user_id,),
+			)
+			rows = cur.fetchall()
+			items = []
+			for r in rows:
+				items.append({
+					'id': str(r[0]),
+					'name': r[1],
+					'dosage': r[2],
+					'frequency': r[3],
+					'time': r[4],
+					'instructions': r[5],
+					'created_at': r[6].isoformat() if getattr(r[6], 'isoformat', None) else str(r[6]),
+					'updated_at': r[7].isoformat() if getattr(r[7], 'isoformat', None) else str(r[7]),
+				})
+			cur.close()
+			conn.close()
+			return jsonify({'ok': True, 'count': len(items), 'items': items}), 200
+		except Exception as exc:
+			app.logger.exception('list_medications: db error')
+			try:
+				cur.close()
+			except Exception:
+				pass
+			try:
+				conn.close()
+			except Exception:
+				pass
+			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+	@app.route('/api/users/<user_id>/medications', methods=['POST'])
+	def api_create_medication(user_id):
+		"""Create a medication record for the user. Owner-only."""
+		actor = _get_actor_user_id()
+		if not actor or str(actor) != str(user_id):
+			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+		payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+		name = payload.get('name') or payload.get('medication_name')
+		if not name:
+			return jsonify({'ok': False, 'error': 'missing_name'}), 400
+		dosage = payload.get('dosage')
+		frequency = payload.get('frequency')
+		time_val = payload.get('time') or payload.get('when')
+		instructions = payload.get('instructions')
+
+		try:
+			conn = get_db_conn()
+			cur = conn.cursor()
+			cur.execute(
+				"INSERT INTO public.user_medications (user_id, name, dosage, frequency, time, instructions) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id, created_at, updated_at",
+				(user_id, name, dosage, frequency, time_val, instructions),
+			)
+			row = cur.fetchone()
+			conn.commit()
+			med = {
+				'id': str(row[0]),
+				'user_id': user_id,
+				'name': name,
+				'dosage': dosage,
+				'frequency': frequency,
+				'time': time_val,
+				'instructions': instructions,
+				'created_at': row[1].isoformat() if getattr(row[1], 'isoformat', None) else str(row[1]),
+				'updated_at': row[2].isoformat() if getattr(row[2], 'isoformat', None) else str(row[2]),
+			}
+			cur.close()
+			conn.close()
+			return jsonify({'ok': True, 'medication': med}), 201
+		except Exception as exc:
+			app.logger.exception('create_medication: db error')
+			try:
+				conn.rollback()
+			except Exception:
+				pass
+			try:
+				cur.close()
+			except Exception:
+				pass
+			try:
+				conn.close()
+			except Exception:
+				pass
+			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+	@app.route('/api/users/<user_id>/medications/<med_id>', methods=['PUT'])
+	def api_update_medication(user_id, med_id):
+		"""Update a medication record for the user. Owner-only."""
+		actor = _get_actor_user_id()
+		if not actor or str(actor) != str(user_id):
+			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+		payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+		allowed = ['name', 'dosage', 'frequency', 'time', 'instructions']
+		updates = {}
+		for k in allowed:
+			if k in payload:
+				updates[k] = payload.get(k)
+
+		if not updates:
+			return jsonify({'ok': False, 'error': 'no_updates'}), 400
+
+		try:
+			conn = get_db_conn()
+			cur = conn.cursor()
+			set_clauses = []
+			params = []
+			for k, v in updates.items():
+				set_clauses.append(f"{k} = %s")
+				params.append(v)
+			params.extend([med_id, user_id])
+			sql = f"UPDATE public.user_medications SET {', '.join(set_clauses)}, updated_at = now() WHERE id = %s AND user_id = %s RETURNING id, name, dosage, frequency, time, instructions, updated_at"
+			cur.execute(sql, tuple(params))
+			row = cur.fetchone()
+			if not row:
+				conn.rollback()
+				cur.close()
+				conn.close()
+				return jsonify({'ok': False, 'error': 'medication_missing'}), 404
+			conn.commit()
+			med = {
+				'id': str(row[0]),
+				'name': row[1],
+				'dosage': row[2],
+				'frequency': row[3],
+				'time': row[4],
+				'instructions': row[5],
+				'updated_at': row[6].isoformat() if getattr(row[6], 'isoformat', None) else str(row[6]),
+			}
+			cur.close()
+			conn.close()
+			return jsonify({'ok': True, 'medication': med}), 200
+		except Exception as exc:
+			app.logger.exception('update_medication: db error')
+			try:
+				conn.rollback()
+			except Exception:
+				pass
+			try:
+				cur.close()
+			except Exception:
+				pass
+			try:
+				conn.close()
+			except Exception:
+				pass
+			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+	@app.route('/api/users/<user_id>/medications/<med_id>', methods=['DELETE'])
+	def api_delete_medication(user_id, med_id):
+		"""Delete a medication record for the user. Owner-only."""
+		actor = _get_actor_user_id()
+		if not actor or str(actor) != str(user_id):
+			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+		try:
+			conn = get_db_conn()
+			cur = conn.cursor()
+			cur.execute("DELETE FROM public.user_medications WHERE id = %s AND user_id = %s RETURNING id", (med_id, user_id))
+			row = cur.fetchone()
+			if not row:
+				conn.rollback()
+				cur.close()
+				conn.close()
+				return jsonify({'ok': False, 'error': 'medication_missing'}), 404
+			conn.commit()
+			cur.close()
+			conn.close()
+			return jsonify({'ok': True}), 200
+		except Exception as exc:
+			app.logger.exception('delete_medication: db error')
+			try:
+				conn.rollback()
+			except Exception:
+				pass
+			try:
+				cur.close()
+			except Exception:
+				pass
+			try:
+				conn.close()
+			except Exception:
+				pass
+			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
 if __name__ == '__main__':

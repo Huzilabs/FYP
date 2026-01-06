@@ -1,0 +1,14 @@
+[project]
+name = "face-auth"
+
+[[services]]
+name = "web"
+path = "."
+start = "docker"
+
+[services.environment]
+# Railway will let you set these via the dashboard settings
+# SUPABASE_URL = ""
+# SUPABASE_SERVICE_ROLE_KEY = ""
+# SUPABASE_DB_URL = ""
+# SUPABASE_BUCKET = ""
