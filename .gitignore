@@ -33,6 +33,7 @@ Thumbs.db
 scripts/
 add_faces.py
 app.py
+tools/
 .env
 *.env.local
 venv/
