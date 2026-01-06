@@ -1437,16 +1437,19 @@ def api_admin_embeddings():
 
 @app.route('/api/users/<user_id>', methods=['GET'])
 def api_get_user(user_id):
-	"""Return user record, images and embedding metadata."""
-	# Only allow the owner (actor) to read this user's details
-	actor = _get_actor_user_id()
-	if not actor or str(actor) != str(user_id):
-		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
-
+	"""Return user record only (no auth check, per request)."""
 	try:
 		conn = get_db_conn()
 		cur = conn.cursor()
-		cur.execute("SELECT id, display_name, username, email, phone, date_of_birth, emergency_contact, medications, allergies, accessibility_needs, preferred_language, created_at FROM public.users WHERE id = %s", (user_id,))
+		cur.execute(
+			"""
+			SELECT id, display_name, username, email, phone, date_of_birth, emergency_contact,
+			       medications, allergies, accessibility_needs, preferred_language, created_at
+			FROM public.users
+			WHERE id = %s
+			""",
+			(user_id,),
+		)
 		row = cur.fetchone()
 		if not row:
 			cur.close()
@@ -1465,20 +1468,12 @@ def api_get_user(user_id):
 			'allergies': row[8],
 			'accessibility_needs': row[9],
 			'preferred_language': row[10],
-			'created_at': row[11].isoformat() if getattr(row[11], 'isoformat', None) else str(row[11])
+			'created_at': row[11].isoformat() if getattr(row[11], 'isoformat', None) else str(row[11]),
 		}
-
-		cur.execute("SELECT id, storage_path, public_url, is_profile, uploaded_at FROM public.user_images WHERE user_id = %s ORDER BY uploaded_at DESC", (user_id,))
-		images = []
-		for r in cur.fetchall():
-			images.append({'id': str(r[0]), 'storage_path': r[1], 'public_url': r[2], 'is_profile': bool(r[3]), 'uploaded_at': r[4].isoformat() if getattr(r[4], 'isoformat', None) else str(r[4])})
-
-		cur.execute("SELECT count(*) FROM public.embeddings WHERE user_id = %s", (user_id,))
-		emb_count = cur.fetchone()[0]
 
 		cur.close()
 		conn.close()
-		return jsonify({'ok': True, 'user': user, 'images': images, 'embedding_count': int(emb_count)}), 200
+		return jsonify({'ok': True, 'user': user}), 200
 	except Exception as exc:
 		app.logger.exception('get_user: db error')
 		try:
