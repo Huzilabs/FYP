@@ -505,6 +505,93 @@ def signup():
 	return render_template('index.html') if os.path.exists(os.path.join(tmpl, 'index.html')) else 'Signup'
 
 
+@app.route('/api/users/<user_id>', methods=['GET'])
+def api_get_user(user_id: str):
+	"""Return basic user details + images + embeddings count.
+
+	Note: No authentication on purpose per user's request. Do not use in production as-is.
+	"""
+	try:
+		conn = get_db_conn()
+		try:
+			cur = conn.cursor()
+			# Fetch user row
+			cur.execute(
+				"""
+				SELECT id, display_name, username, email, phone, verified, created_at
+				FROM public.users
+				WHERE id = %s
+				""",
+				(user_id,),
+			)
+			row = cur.fetchone()
+			if not row:
+				cur.close()
+				try:
+					conn.close()
+				except Exception:
+					pass
+				return jsonify({
+					'ok': False,
+					'error': 'not_found',
+					'detail': 'user not found'
+				}), 404
+
+			# Map row to dict
+			user_obj = {
+				'id': row[0],
+				'display_name': row[1],
+				'username': row[2],
+				'email': row[3],
+				'phone': row[4],
+				'verified': row[5],
+				'created_at': row[6].isoformat() if hasattr(row[6], 'isoformat') else row[6],
+			}
+
+			# Images
+			cur.execute(
+				"""
+				SELECT storage_path, public_url, uploaded_at, is_profile, width, height, mime_type
+				FROM public.user_images
+				WHERE user_id = %s
+				ORDER BY uploaded_at DESC
+				""",
+				(user_id,),
+			)
+			images = []
+			for r in cur.fetchall() or []:
+				images.append({
+					'storage_path': r[0],
+					'public_url': r[1],
+					'uploaded_at': r[2].isoformat() if hasattr(r[2], 'isoformat') else r[2],
+					'is_profile': r[3],
+					'width': r[4],
+					'height': r[5],
+					'mime_type': r[6],
+				})
+
+			# Embeddings count
+			cur.execute("SELECT COUNT(*) FROM public.embeddings WHERE user_id = %s", (user_id,))
+			emb_count = int(cur.fetchone()[0])
+
+			cur.close()
+			try:
+				conn.close()
+			except Exception:
+				pass
+
+			return jsonify({'ok': True, 'user': user_obj, 'images': images, 'embeddings_count': emb_count}), 200
+		except Exception:
+			try:
+				conn.close()
+			except Exception:
+				pass
+			raise
+	except Exception as exc:
+		app.logger.exception('api_get_user failed')
+		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
 @app.route('/health', methods=['GET'])
 def health_check():
 	"""Health endpoint for load balancers and deployment checks.
