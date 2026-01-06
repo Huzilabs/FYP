@@ -92,6 +92,37 @@ All endpoints are under `/api/` except the legacy `/signup` form endpoint.
 curl -H "Content-Type: application/json" -H "X-User-Id: <USER_ID>" \
   -d '{"display_name":"New Name"}' \
   -X PUT https://your-host/api/users/<USER_ID>
+
+  **API Endpoints (User & Medications)**
+
+  These endpoints are part of the backend HTTP API exposed by `webapp_new.py`.
+
+  - **GET /api/users/<user_id>**: returns the user's personal details (display name, username, email, phone, date_of_birth, emergency contact, stored `medications` JSON, `allergies`, and other profile fields).
+
+    Example:
+    curl -i "http://127.0.0.1:5000/api/users/a3dc85bd-94e3-419b-89b9-5364e398649a"
+
+  - **PUT /api/users/<user_id>**: update allowed profile fields. This endpoint enforces an `actor` check — the caller must provide `X-User-Id` header matching the `user_id` (replace with proper auth in production).
+
+  - **GET /api/users/<user_id>/medications**: list medication rows stored in `public.user_medications` for that user. Returns `count` and `items` array of records.
+
+    Example:
+    curl -i "http://127.0.0.1:5000/api/users/a3dc85bd-94e3-419b-89b9-5364e398649a/medications"
+
+  - **POST /api/users/<user_id>/medications**: create a medication row for the user. Owner-only — include `X-User-Id` header equal to `user_id`.
+
+    Example:
+    curl -s -X POST "http://127.0.0.1:5000/api/users/a3dc85bd-94e3-419b-89b9-5364e398649a/medications" \
+      -H "Content-Type: application/json" -H "X-User-Id: a3dc85bd-94e3-419b-89b9-5364e398649a" \
+      -d '{"name":"vitamin C","dosage":"500mg","frequency":"daily"}'
+
+  - **PUT /api/users/<user_id>/medications/<med_id>**: update an existing medication row (owner-only). Provide the same `X-User-Id` header.
+
+  - **DELETE /api/users/<user_id>/medications/<med_id>**: delete a medication row (owner-only).
+
+  Notes:
+  - The `GET /api/users/<user_id>` endpoint is intended for showing a user's health/profile page (personal details and their `medications` JSON field).
+  - The medications CRUD endpoints persist records in `public.user_medications` and can be used by the frontend to manage a user's medications list.
 ```
 
 Security note: this header-based check is a minimal convenience for local or trusted frontends. For production, replace with proper authentication (JWT, Supabase auth, or API keys) and validate tokens server-side before authorizing CRUD operations.
