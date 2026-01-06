@@ -243,6 +243,51 @@ def _get_actor_user_id():
 		return None
 
 
+def decode_base64_image(data_url: str) -> Tuple[np.ndarray, bytes]:
+	"""Decode a data URL or raw base64 image string into (numpy array, raw bytes).
+
+	Supports inputs like:
+	- "data:image/jpeg;base64,/9j/4AAQ..."
+	- the raw base64 payload ("/9j/4AAQ...")
+
+	Returns:
+	- (image_array, image_bytes)
+	
+	Raises a ValueError on invalid input or decode failure.
+	"""
+	if not data_url:
+		raise ValueError('empty image data')
+	if not isinstance(data_url, str):
+		raise ValueError('data_url must be a string')
+	# strip whitespace
+	s = data_url.strip()
+	# If it's a data URL like data:<mime>;base64,<payload>
+	if s.startswith('data:'):
+		try:
+			header, b64 = s.split(',', 1)
+		except Exception:
+			raise ValueError('invalid data URL')
+	else:
+		b64 = s
+	# Some clients may include URL-safe base64 or stray whitespace/newlines
+	try:
+		img_bytes = base64.b64decode(b64, validate=False)
+	except Exception:
+		# Try a more permissive urlsafe decode as fallback
+		try:
+			import base64 as _b64
+			img_bytes = _b64.urlsafe_b64decode(b64 + '==')
+		except Exception as exc:
+			raise ValueError('base64 decode failed: %s' % exc)
+	# Load image into PIL and convert to RGB numpy array
+	try:
+		img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+		arr = np.array(img)
+		return arr, img_bytes
+	except Exception as exc:
+		raise ValueError('failed to parse image bytes: %s' % exc)
+
+
 def ensure_storage_ready():
 		"""Ensure Supabase storage client and bucket are configured."""
 		if not sb or not SUPABASE_BUCKET:
@@ -288,97 +333,60 @@ def api_list_medications(user_id):
 			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
-		def normalize_public_url(resp) -> str:
-			"""Normalize various Supabase SDK/storage responses into a public URL string.
+def normalize_public_url(resp) -> str:
+	"""Normalize various Supabase SDK/storage responses into a public URL string.
 
-			Accepts:
-			- plain string URL
-			- dict returned by Supabase Python/JS SDK (keys like 'publicURL','publicUrl','signedURL','signedUrl')
-			- nested dicts under 'data'
-			Returns empty string when no usable URL found.
-			"""
-			try:
-				if not resp:
-					return ''
-
-
-				def coerce_bool(val) -> bool:
-					"""Coerce common truthy/falsy representations to Python bool.
-
-					Accepts: booleans, numbers, and strings like 'true', '1', 'yes', 'on'.
-					Returns False for None or unknown strings.
-					"""
-					try:
-						if val is None:
-							return False
-						if isinstance(val, bool):
-							return val
-						if isinstance(val, (int, float)):
-							return bool(val)
-						s = str(val).strip().lower()
-						return s in ('1', 'true', 't', 'yes', 'y', 'on')
-					except Exception:
-						return False
-
-
-				def coerce_bool(val) -> bool:
-					"""Coerce a value from form/query/json into a boolean.
-
-					Treats common truthy strings ('true','1','yes','on') and numeric 1 as True.
-					Everything else is False.
-					"""
-					if isinstance(val, bool):
-						return val
-					if val is None:
-						return False
-					if isinstance(val, (int, float)):
-						return bool(val)
-					s = str(val).strip().lower()
-					if not s:
-						return False
-					return s in ('1', 'true', 'yes', 'on')
-				# string directly
-				if isinstance(resp, str):
-					return resp
-				# bytes
-				if isinstance(resp, (bytes, bytearray)):
-					try:
-						s = resp.decode('utf-8')
-						return s if s.startswith('http') else ''
-					except Exception:
-						return ''
-				# dict-like
-				if isinstance(resp, dict):
-					# common keys
-					for key in ('signedURL', 'signedUrl', 'publicURL', 'publicUrl', 'url'):
-						val = resp.get(key)
-						if isinstance(val, str) and val:
-							return val
-					# sometimes SDK wraps result in 'data'
-					data = resp.get('data')
-					if isinstance(data, str) and data.startswith('http'):
-						return data
-					if isinstance(data, dict):
-						for key in ('signedURL', 'signedUrl', 'publicURL', 'publicUrl', 'url'):
-							val = data.get(key)
-							if isinstance(val, str) and val:
-								return val
-					# fallback: sometimes SDK returns {'url': None, 'data': {'publicURL': ...}}
-					# try any string value in the dict
-					for v in resp.values():
-						if isinstance(v, str) and v.startswith('http'):
-							return v
-						if isinstance(v, dict):
-							for vv in v.values():
-								if isinstance(vv, str) and vv.startswith('http'):
-									return vv
-				# fallback to string representation
-				s = str(resp)
-				if s.startswith('http'):
-					return s
-			except Exception:
-				pass
+	Accepts:
+	- plain string URL
+	- dict returned by Supabase Python/JS SDK (keys like 'publicURL','publicUrl','signedURL','signedUrl')
+	- nested dicts under 'data'
+	Returns empty string when no usable URL found.
+	"""
+	try:
+		if not resp:
 			return ''
+
+		# string directly
+		if isinstance(resp, str):
+			return resp
+		# bytes
+		if isinstance(resp, (bytes, bytearray)):
+			try:
+				s = resp.decode('utf-8')
+				return s if s.startswith('http') else ''
+			except Exception:
+				return ''
+		# dict-like
+		if isinstance(resp, dict):
+			# common keys
+			for key in ('signedURL', 'signedUrl', 'publicURL', 'publicUrl', 'url'):
+				val = resp.get(key)
+				if isinstance(val, str) and val:
+					return val
+			# sometimes SDK wraps result in 'data'
+			data = resp.get('data')
+			if isinstance(data, str) and data.startswith('http'):
+				return data
+			if isinstance(data, dict):
+				for key in ('signedURL', 'signedUrl', 'publicURL', 'publicUrl', 'url'):
+					val = data.get(key)
+					if isinstance(val, str) and val:
+						return val
+			# fallback: search any nested string values
+			for v in resp.values():
+				if isinstance(v, str) and v.startswith('http'):
+					return v
+				if isinstance(v, dict):
+					for vv in v.values():
+						if isinstance(vv, str) and vv.startswith('http'):
+							return vv
+		# fallback to string representation
+		s = str(resp)
+		if s.startswith('http'):
+			return s
+	except Exception:
+		pass
+	return ''
 
 
 @app.route('/api/users/<user_id>/medications', methods=['POST'])
