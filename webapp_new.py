@@ -289,48 +289,9 @@ def decode_base64_image(data_url: str) -> Tuple[np.ndarray, bytes]:
 
 
 def ensure_storage_ready():
-		"""Ensure Supabase storage client and bucket are configured."""
-		if not sb or not SUPABASE_BUCKET:
-			raise RuntimeError('Supabase storage not configured; check SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_BUCKET')
-
-
-@app.route('/api/users/<user_id>/medications', methods=['GET'])
-def api_list_medications(user_id):
-		"""List medications for a user."""
-		try:
-			conn = get_db_conn()
-			cur = conn.cursor()
-			cur.execute(
-				"SELECT id, name, dosage, frequency, time, instructions, created_at, updated_at FROM public.user_medications WHERE user_id = %s ORDER BY created_at DESC",
-				(user_id,),
-			)
-			rows = cur.fetchall()
-			items = []
-			for r in rows:
-				items.append({
-					'id': str(r[0]),
-					'name': r[1],
-					'dosage': r[2],
-					'frequency': r[3],
-					'time': r[4],
-					'instructions': r[5],
-					'created_at': r[6].isoformat() if getattr(r[6], 'isoformat', None) else str(r[6]),
-					'updated_at': r[7].isoformat() if getattr(r[7], 'isoformat', None) else str(r[7]),
-				})
-			cur.close()
-			conn.close()
-			return jsonify({'ok': True, 'count': len(items), 'items': items}), 200
-		except Exception as exc:
-			app.logger.exception('list_medications: db error')
-			try:
-				cur.close()
-			except Exception:
-				pass
-			try:
-				conn.close()
-			except Exception:
-				pass
-			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+	"""Ensure Supabase storage client and bucket are configured."""
+	if not sb or not SUPABASE_BUCKET:
+		raise RuntimeError('Supabase storage not configured; check SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_BUCKET')
 
 
 def normalize_public_url(resp) -> str:
@@ -1735,7 +1696,9 @@ def api_admin_embeddings():
 
 @app.route('/api/users/<user_id>', methods=['GET'])
 def api_get_user(user_id):
-	"""Return user record only (no auth check, per request)."""
+	"""Return user record, images and embedding metadata."""
+	conn = None
+	cur = None
 	try:
 		conn = get_db_conn()
 		cur = conn.cursor()
@@ -1750,8 +1713,6 @@ def api_get_user(user_id):
 		)
 		row = cur.fetchone()
 		if not row:
-			cur.close()
-			conn.close()
 			return jsonify({'ok': False, 'error': 'user_missing'}), 404
 
 		user = {
@@ -1769,20 +1730,44 @@ def api_get_user(user_id):
 			'created_at': row[11].isoformat() if getattr(row[11], 'isoformat', None) else str(row[11]),
 		}
 
-		cur.close()
-		conn.close()
-		return jsonify({'ok': True, 'user': user}), 200
+		# fetch user images
+		cur.execute("SELECT id, storage_path, public_url, is_profile, uploaded_at FROM public.user_images WHERE user_id = %s ORDER BY uploaded_at DESC", (user_id,))
+		images = []
+		for r in cur.fetchall():
+			images.append({
+				'id': str(r[0]),
+				'storage_path': r[1],
+				'public_url': r[2],
+				'is_profile': bool(r[3]),
+				'uploaded_at': r[4].isoformat() if getattr(r[4], 'isoformat', None) else str(r[4]),
+			})
+
+		# count embeddings
+		cur.execute("SELECT count(*) FROM public.embeddings WHERE user_id = %s", (user_id,))
+		emb_count = cur.fetchone()[0]
+
+		return jsonify({'ok': True, 'user': user, 'images': images, 'embedding_count': int(emb_count)}), 200
 	except Exception as exc:
 		app.logger.exception('get_user: db error')
-		try:
-			cur.close()
-		except Exception:
-			pass
-		try:
-			conn.close()
-		except Exception:
-			pass
 		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+	finally:
+		try:
+			if cur:
+				cur.close()
+		except Exception:
+			pass
+		try:
+			if conn:
+				try:
+					# prefer pool release if available
+					release_db_conn(conn)
+				except Exception:
+					try:
+						conn.close()
+					except Exception:
+						pass
+		except Exception:
+			pass
 
 
 @app.route('/api/users/<user_id>', methods=['PUT'])
@@ -1970,201 +1955,261 @@ def api_delete_image(image_id):
 		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
-	@app.route('/api/users/<user_id>/medications', methods=['GET'])
-	def api_list_medications(user_id):
-		"""List medications for a user."""
+@app.route('/api/users/<user_id>/medications', methods=['GET'])
+def api_list_medications(user_id):
+	"""List all medications for a user."""
+	conn = None
+	cur = None
+	try:
+		conn = get_db_conn()
+		cur = conn.cursor()
+		cur.execute(
+			"""
+			SELECT id, name, dosage, frequency, "time", instructions, created_at, updated_at
+			FROM public.user_medications
+			WHERE user_id = %s
+			ORDER BY created_at DESC
+			""",
+			(user_id,)
+		)
+		rows = cur.fetchall()
+		items = []
+		for r in rows:
+			items.append({
+				'id': str(r[0]),
+				'name': r[1],
+				'dosage': r[2],
+				'frequency': r[3],
+				'time': r[4],
+				'instructions': r[5],
+				'created_at': r[6].isoformat() if getattr(r[6], 'isoformat', None) else str(r[6]),
+				'updated_at': r[7].isoformat() if getattr(r[7], 'isoformat', None) else str(r[7]),
+			})
+		return jsonify({'ok': True, 'count': len(items), 'items': items}), 200
+	except Exception as exc:
+		app.logger.exception('list_medications: db error')
+		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+	finally:
 		try:
-			conn = get_db_conn()
-			cur = conn.cursor()
-			cur.execute(
-				"SELECT id, name, dosage, frequency, time, instructions, created_at, updated_at FROM public.user_medications WHERE user_id = %s ORDER BY created_at DESC",
-				(user_id,),
-			)
-			rows = cur.fetchall()
-			items = []
-			for r in rows:
-				items.append({
-					'id': str(r[0]),
-					'name': r[1],
-					'dosage': r[2],
-					'frequency': r[3],
-					'time': r[4],
-					'instructions': r[5],
-					'created_at': r[6].isoformat() if getattr(r[6], 'isoformat', None) else str(r[6]),
-					'updated_at': r[7].isoformat() if getattr(r[7], 'isoformat', None) else str(r[7]),
-				})
-			cur.close()
-			conn.close()
-			return jsonify({'ok': True, 'count': len(items), 'items': items}), 200
-		except Exception as exc:
-			app.logger.exception('list_medications: db error')
-			try:
+			if cur:
 				cur.close()
-			except Exception:
-				pass
-			try:
-				conn.close()
-			except Exception:
-				pass
-			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-
-
-	@app.route('/api/users/<user_id>/medications', methods=['POST'])
-	def api_create_medication(user_id):
-		"""Create a medication record for the user. Owner-only."""
-		actor = _get_actor_user_id()
-		if not actor or str(actor) != str(user_id):
-			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
-
-		payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
-		name = payload.get('name') or payload.get('medication_name')
-		if not name:
-			return jsonify({'ok': False, 'error': 'missing_name'}), 400
-		dosage = payload.get('dosage')
-		frequency = payload.get('frequency')
-		time_val = payload.get('time') or payload.get('when')
-		instructions = payload.get('instructions')
-
+		except Exception:
+			pass
 		try:
-			conn = get_db_conn()
-			cur = conn.cursor()
-			cur.execute(
-				"INSERT INTO public.user_medications (user_id, name, dosage, frequency, time, instructions) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id, created_at, updated_at",
-				(user_id, name, dosage, frequency, time_val, instructions),
-			)
-			row = cur.fetchone()
-			conn.commit()
-			med = {
-				'id': str(row[0]),
-				'user_id': user_id,
-				'name': name,
-				'dosage': dosage,
-				'frequency': frequency,
-				'time': time_val,
-				'instructions': instructions,
-				'created_at': row[1].isoformat() if getattr(row[1], 'isoformat', None) else str(row[1]),
-				'updated_at': row[2].isoformat() if getattr(row[2], 'isoformat', None) else str(row[2]),
-			}
-			cur.close()
-			conn.close()
-			return jsonify({'ok': True, 'medication': med}), 201
-		except Exception as exc:
-			app.logger.exception('create_medication: db error')
+			if conn:
+				# return to pool or close
+				try:
+					release_db_conn(conn)
+				except Exception:
+					try:
+						conn.close()
+					except Exception:
+						pass
+		except Exception:
+			pass
+
+
+@app.route('/api/users/<user_id>/medications', methods=['POST'])
+def api_create_medication(user_id):
+	"""Create a new medication for a user (owner-only)."""
+	actor = _get_actor_user_id()
+	if not actor or str(actor) != str(user_id):
+		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+	payload = request.get_json(force=True, silent=True) or {}
+	name = (payload.get('name') or payload.get('medication_name') or '').strip()
+	if not name:
+		return jsonify({'ok': False, 'error': 'missing_name'}), 400
+	dosage = payload.get('dosage')
+	frequency = payload.get('frequency')
+	time_val = payload.get('time') or payload.get('when')
+	instructions = payload.get('instructions')
+
+	conn = None
+	cur = None
+	try:
+		conn = get_db_conn()
+		cur = conn.cursor()
+		cur.execute(
+			"""
+			INSERT INTO public.user_medications (user_id, name, dosage, frequency, "time", instructions)
+			VALUES (%s, %s, %s, %s, %s, %s)
+			RETURNING id, user_id, name, dosage, frequency, "time", instructions, created_at, updated_at
+			""",
+			(user_id, name, dosage, frequency, time_val, instructions),
+		)
+		row = cur.fetchone()
+		conn.commit()
+		medication = {
+			'id': str(row[0]),
+			'user_id': str(row[1]),
+			'name': row[2],
+			'dosage': row[3],
+			'frequency': row[4],
+			'time': row[5],
+			'instructions': row[6],
+			'created_at': row[7].isoformat() if getattr(row[7], 'isoformat', None) else str(row[7]),
+			'updated_at': row[8].isoformat() if getattr(row[8], 'isoformat', None) else str(row[8]),
+		}
+		return jsonify({'ok': True, 'medication': medication}), 201
+	except Exception as exc:
+		app.logger.exception('create_medication: db error')
+		if conn:
 			try:
 				conn.rollback()
 			except Exception:
 				pass
-			try:
-				cur.close()
-			except Exception:
-				pass
-			try:
-				conn.close()
-			except Exception:
-				pass
-			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-
-
-	@app.route('/api/users/<user_id>/medications/<med_id>', methods=['PUT'])
-	def api_update_medication(user_id, med_id):
-		"""Update a medication record for the user. Owner-only."""
-		actor = _get_actor_user_id()
-		if not actor or str(actor) != str(user_id):
-			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
-
-		payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
-		allowed = ['name', 'dosage', 'frequency', 'time', 'instructions']
-		updates = {}
-		for k in allowed:
-			if k in payload:
-				updates[k] = payload.get(k)
-
-		if not updates:
-			return jsonify({'ok': False, 'error': 'no_updates'}), 400
-
+		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+	finally:
 		try:
-			conn = get_db_conn()
-			cur = conn.cursor()
-			set_clauses = []
-			params = []
-			for k, v in updates.items():
-				set_clauses.append(f"{k} = %s")
-				params.append(v)
-			params.extend([med_id, user_id])
-			sql = f"UPDATE public.user_medications SET {', '.join(set_clauses)}, updated_at = now() WHERE id = %s AND user_id = %s RETURNING id, name, dosage, frequency, time, instructions, updated_at"
-			cur.execute(sql, tuple(params))
-			row = cur.fetchone()
-			if not row:
-				conn.rollback()
+			if cur:
 				cur.close()
-				conn.close()
-				return jsonify({'ok': False, 'error': 'medication_missing'}), 404
-			conn.commit()
-			med = {
-				'id': str(row[0]),
-				'name': row[1],
-				'dosage': row[2],
-				'frequency': row[3],
-				'time': row[4],
-				'instructions': row[5],
-				'updated_at': row[6].isoformat() if getattr(row[6], 'isoformat', None) else str(row[6]),
-			}
-			cur.close()
-			conn.close()
-			return jsonify({'ok': True, 'medication': med}), 200
-		except Exception as exc:
-			app.logger.exception('update_medication: db error')
-			try:
-				conn.rollback()
-			except Exception:
-				pass
-			try:
-				cur.close()
-			except Exception:
-				pass
-			try:
-				conn.close()
-			except Exception:
-				pass
-			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-
-
-	@app.route('/api/users/<user_id>/medications/<med_id>', methods=['DELETE'])
-	def api_delete_medication(user_id, med_id):
-		"""Delete a medication record for the user. Owner-only."""
-		actor = _get_actor_user_id()
-		if not actor or str(actor) != str(user_id):
-			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
-
+		except Exception:
+			pass
 		try:
-			conn = get_db_conn()
-			cur = conn.cursor()
-			cur.execute("DELETE FROM public.user_medications WHERE id = %s AND user_id = %s RETURNING id", (med_id, user_id))
-			row = cur.fetchone()
-			if not row:
-				conn.rollback()
-				cur.close()
-				conn.close()
-				return jsonify({'ok': False, 'error': 'medication_missing'}), 404
-			conn.commit()
-			cur.close()
-			conn.close()
-			return jsonify({'ok': True}), 200
-		except Exception as exc:
-			app.logger.exception('delete_medication: db error')
+			if conn:
+				try:
+					release_db_conn(conn)
+				except Exception:
+					try:
+						conn.close()
+					except Exception:
+						pass
+		except Exception:
+			pass
+
+
+@app.route('/api/users/<user_id>/medications/<med_id>', methods=['PUT'])
+def api_update_medication(user_id, med_id):
+	"""Update a medication. Owner-only."""
+	actor = _get_actor_user_id()
+	if not actor or str(actor) != str(user_id):
+		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+	payload = request.get_json(force=True, silent=True) or {}
+	allowed_fields = ['name', 'dosage', 'frequency', 'time', 'instructions']
+	set_clauses = []
+	params = []
+	for field in allowed_fields:
+		if field in payload:
+			if field == 'time':
+				set_clauses.append('"time" = %s')
+			else:
+				set_clauses.append(f"{field} = %s")
+			params.append(payload[field])
+
+	if not set_clauses:
+		return jsonify({'ok': False, 'error': 'no_updates'}), 400
+
+	params.extend([med_id, user_id])
+	conn = None
+	cur = None
+	try:
+		conn = get_db_conn()
+		cur = conn.cursor()
+		sql = f"""
+			UPDATE public.user_medications
+			SET {', '.join(set_clauses)}, updated_at = now()
+			WHERE id = %s AND user_id = %s
+			RETURNING id, name, dosage, frequency, "time", instructions, updated_at
+		"""
+		cur.execute(sql, tuple(params))
+		row = cur.fetchone()
+		if not row:
 			try:
 				conn.rollback()
 			except Exception:
 				pass
+			return jsonify({'ok': False, 'error': 'medication_missing'}), 404
+		conn.commit()
+		medication = {
+			'id': str(row[0]),
+			'name': row[1],
+			'dosage': row[2],
+			'frequency': row[3],
+			'time': row[4],
+			'instructions': row[5],
+			'updated_at': row[6].isoformat() if getattr(row[6], 'isoformat', None) else str(row[6]),
+		}
+		return jsonify({'ok': True, 'medication': medication}), 200
+	except Exception as exc:
+		app.logger.exception('update_medication: db error')
+		if conn:
 			try:
+				conn.rollback()
+			except Exception:
+				pass
+		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+	finally:
+		try:
+			if cur:
 				cur.close()
-			except Exception:
-				pass
+		except Exception:
+			pass
+		try:
+			if conn:
+				try:
+					release_db_conn(conn)
+				except Exception:
+					try:
+						conn.close()
+					except Exception:
+						pass
+		except Exception:
+			pass
+
+
+@app.route('/api/users/<user_id>/medications/<med_id>', methods=['DELETE'])
+def api_delete_medication(user_id, med_id):
+	"""Delete a medication. Owner-only."""
+	actor = _get_actor_user_id()
+	if not actor or str(actor) != str(user_id):
+		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+	conn = None
+	cur = None
+	try:
+		conn = get_db_conn()
+		cur = conn.cursor()
+		cur.execute("""
+			DELETE FROM public.user_medications
+			WHERE id = %s AND user_id = %s
+			RETURNING id
+		""", (med_id, user_id))
+		row = cur.fetchone()
+		if not row:
 			try:
-				conn.close()
+				conn.rollback()
 			except Exception:
 				pass
-			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+			return jsonify({'ok': False, 'error': 'medication_missing'}), 404
+		conn.commit()
+		return jsonify({'ok': True}), 200
+	except Exception as exc:
+		app.logger.exception('delete_medication: db error')
+		if conn:
+			try:
+				conn.rollback()
+			except Exception:
+				pass
+		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+	finally:
+		try:
+			if cur:
+				cur.close()
+		except Exception:
+			pass
+		try:
+			if conn:
+				try:
+					release_db_conn(conn)
+				except Exception:
+					try:
+						conn.close()
+					except Exception:
+						pass
+		except Exception:
+			pass
 
 
 if __name__ == '__main__':
