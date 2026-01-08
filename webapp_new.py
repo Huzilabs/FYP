@@ -13,9 +13,6 @@ import logging
 import sys
 import json
 import numpy as np
-import psycopg2
-from psycopg2 import pool as pgpool
-from urllib.parse import urlparse
 
 load_dotenv()
 SUPABASE_URL = os.getenv('SUPABASE_URL')
@@ -80,432 +77,274 @@ def _set_cors_headers(response):
 	return response
 
 # Cache whether pgvector `vector` type exists to avoid repeated checks
-
 _HAS_VECTOR = None
 
-# Cache detected vector schema name
+
+def _detect_vector_type() -> bool:
+	global _HAS_VECTOR
+	# If we've previously determined pgvector exists, return cached True immediately.
+	if _HAS_VECTOR is True:
+		return True
+	# Otherwise, re-check the DB (this allows a prior False cache to be re-evaluated
+	# after migrations or admin changes).
+	try:
+		conn = None
+		try:
+			conn = get_db_conn()
+			cur = conn.cursor()
+			# Check both pg_extension (installation) and pg_type (type existence with schema)
+			cur.execute("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector') OR EXISTS(SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'vector')")
+			_HAS_VECTOR = bool(cur.fetchone()[0])
+			cur.close()
+		finally:
+			try:
+				if conn:
+					conn.close()
+			except Exception:
+				pass
+	except Exception:
+		app.logger.exception('error detecting pgvector type')
+		_HAS_VECTOR = False
+	return _HAS_VECTOR
+
+
+# Cache the schema name that contains the `vector` type (pgvector)
 _VECTOR_SCHEMA = None
+
+# Global pooled connection container (initialized lazily)
+_DB_POOL = None
 
 
 def _detect_vector_schema() -> Optional[str]:
-	"""Return the schema name that defines the `vector` type, or None."""
+	"""Return the schema name that contains the `vector` type, or None if not found.
+
+	This is used to construct schema-qualified casts like `schema.vector(128)` when
+	the extension is installed into a non-public schema (e.g. `vector_ext`).
+	The result is cached in `_VECTOR_SCHEMA` but will be rechecked if None.
+	"""
 	global _VECTOR_SCHEMA
 	if _VECTOR_SCHEMA is not None:
 		return _VECTOR_SCHEMA
 	try:
 		conn = get_db_conn()
 		cur = conn.cursor()
-		cur.execute("SELECT n.nspname FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'vector' LIMIT 1")
+		# Find the namespace (schema) that defines a type named 'vector'
+		cur.execute("""
+			SELECT n.nspname
+			FROM pg_type t
+			JOIN pg_namespace n ON t.typnamespace = n.oid
+			WHERE t.typname = 'vector'
+			LIMIT 1
+		""")
 		row = cur.fetchone()
 		cur.close()
-		conn.close()
+		try:
+			conn.close()
+		except Exception:
+			pass
 		if row and row[0]:
 			_VECTOR_SCHEMA = row[0]
 			return _VECTOR_SCHEMA
 	except Exception:
+		app.logger.debug('could not detect vector schema')
+	_VECTOR_SCHEMA = None
+	return None
+
+
+def coerce_bool(value: Optional[str]) -> bool:
+	if isinstance(value, bool):
+		return value
+	if value is None:
+		return False
+	return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _get_actor_user_id():
+	"""Resolve caller identity for owner-only checks.
+
+	This accepts either header `X-User-Id` or form/json field `actor_user_id`.
+	It's a minimal protection mechanism intended for local/dev usage until
+	proper authentication is added (JWT / API key / Supabase auth).
+	"""
+	# Prefer header
+	try:
+		uid = request.headers.get('X-User-Id')
+		if uid:
+			return uid
+	except Exception:
+		pass
+	# Fall back to body param
+	try:
+		payload = request.get_json(silent=True) if request.is_json else request.form.to_dict()
+		if payload:
+			uid = payload.get('actor_user_id') or payload.get('user_id')
+			if uid:
+				return uid
+	except Exception:
 		pass
 	return None
 
-# Database pool (lazy-initialized)
-_DB_POOL = None
-
-def init_db_pool():
-	global _DB_POOL
-	if _DB_POOL is not None:
-		return
-	if not SUPABASE_DB_URL:
-		return
-	try:
-		maxconn = int(os.getenv('SUPABASE_DB_MAX_CONN', '10'))
-	except Exception:
-		maxconn = 10
-	try:
-		_DB_POOL = pgpool.ThreadedConnectionPool(1, maxconn, dsn=SUPABASE_DB_URL, sslmode=os.getenv('SUPABASE_DB_SSLMODE', 'require'))
-		app.logger.info('Initialized DB pool (maxconn=%d)', maxconn)
-	except Exception:
-		app.logger.exception('init_db_pool failed; falling back to direct connects')
-		_DB_POOL = None
 
 def get_db_conn():
-	"""Return a DB connection. Uses a threaded pool in production, falls back to direct connect."""
+	"""Return a DB connection, using a ThreadedConnectionPool when possible.
+
+	This function lazily initializes a pool stored in `_DB_POOL`. Connections
+	returned from the pool have their `.close()` monkeypatched to return the
+	connection to the pool so existing code that calls `conn.close()` continues
+	to work.
+	"""
 	global _DB_POOL
 	if not SUPABASE_DB_URL:
-		raise RuntimeError('SUPABASE_DB_URL not configured')
+		raise RuntimeError('SUPABASE_DB_URL not set')
+	try:
+		import psycopg2  # type: ignore
+		from psycopg2 import pool as pgpool
+	except Exception as exc:
+		raise RuntimeError('psycopg2 is required: ' + str(exc))
+
+	# Initialize pool lazily
 	if _DB_POOL is None:
-		init_db_pool()
+		try:
+			maxconn = int(os.getenv('SUPABASE_DB_MAX_CONN', '10'))
+		except Exception:
+			maxconn = 10
+		try:
+			# ensure sslmode present in DSN
+			dsn = SUPABASE_DB_URL
+			if 'sslmode' not in (dsn or '').lower():
+				if '?' in dsn:
+					dsn = dsn + '&sslmode=require'
+				else:
+					dsn = dsn + '?sslmode=require'
+			_DB_POOL = pgpool.ThreadedConnectionPool(1, maxconn, dsn)
+			app.logger.info('Initialized DB pool (maxconn=%d)', maxconn)
+		except Exception:
+			app.logger.exception('failed to initialize DB pool; falling back to direct connect')
+			_DB_POOL = None
+
+	# If pool is available, getconn; otherwise fall back to direct connect
 	if _DB_POOL:
 		conn = _DB_POOL.getconn()
-		# make conn.close() return the connection to the pool for callers that call close()
-		def _return_conn(*args, **kwargs):
+	else:
+		conn = psycopg2.connect(SUPABASE_DB_URL)
+
+	conn.autocommit = False
+	# Prefer vector_ext in the search_path so ::vector casts resolve if pgvector
+	try:
+		cur = conn.cursor()
+		cur.execute("SET search_path = vector_ext, public;")
+		cur.close()
+	except Exception:
+		app.logger.debug('failed to set search_path to include vector_ext')
+
+	# If using a pool, monkeypatch conn.close to return to pool so existing
+	# call sites that call conn.close() won't permanently close the connection.
+	if _DB_POOL:
+		try:
+			orig_close = getattr(conn, 'close', None)
+			def _return_to_pool(*a, **k):
+				try:
+					_DB_POOL.putconn(conn)
+				except Exception:
+					try:
+						if orig_close:
+							orig_close()
+					except Exception:
+						pass
+			conn.close = _return_to_pool
+		except Exception:
+			app.logger.debug('could not monkeypatch conn.close to return to pool')
+
+	return conn
+
+
+def release_db_conn(conn):
+	"""Release a connection back to the pool or close it if no pool.
+
+	Safe to call with None.
+	"""
+	global _DB_POOL
+	if not conn:
+		return
+	try:
+		if _DB_POOL:
 			try:
 				_DB_POOL.putconn(conn)
+				return
 			except Exception:
 				try:
 					conn.close()
 				except Exception:
 					pass
-		try:
-			conn.close = _return_conn
-		except Exception:
-			pass
-		return conn
-	# fallback: direct connect
-	return psycopg2.connect(dsn=SUPABASE_DB_URL, sslmode=os.getenv('SUPABASE_DB_SSLMODE', 'require'))
-
-
-def _detect_vector_type() -> bool:
-	global _HAS_VECTOR
-	if _HAS_VECTOR is not None:
-		return _HAS_VECTOR
-	try:
-		conn = get_db_conn()
-		cur = conn.cursor()
-		cur.execute("SELECT 1 FROM pg_type WHERE typname = 'vector' LIMIT 1")
-		exists = cur.fetchone() is not None
-		cur.close()
-		conn.close()
-		_HAS_VECTOR = bool(exists)
-	except Exception:
-		_HAS_VECTOR = False
-	return _HAS_VECTOR
-
-
-def coerce_bool(val) -> bool:
-	"""Coerce common truthy/falsy representations to Python bool.
-
-	Accepts booleans, numbers, and strings like 'true', '1', 'yes', 'on'.
-	Returns False for None or unknown/empty strings.
-	"""
-	try:
-		if val is None:
-			return False
-		if isinstance(val, bool):
-			return val
-		if isinstance(val, (int, float)):
-			return bool(val)
-		s = str(val).strip().lower()
-		if not s:
-			return False
-		return s in ('1', 'true', 't', 'yes', 'y', 'on')
-	except Exception:
-		return False
-
-
-def save_debug_image(tag: str, img_arr) -> None:
-	"""Save a small debug JPEG of `img_arr` into the debug folder.
-
-	Non-fatal: logs exceptions and returns silently on failure.
-	"""
-	try:
-		if img_arr is None:
-			return
-		# Ensure debug dir exists
-		os.makedirs(DEBUG_DIR, exist_ok=True)
-		fname = f"{int(time.time())}_{tag}_{uuid.uuid4().hex}.jpg"
-		path = os.path.join(DEBUG_DIR, fname)
-		# Convert numpy array to PIL and save
-		from PIL import Image as PILImage
-		im = PILImage.fromarray(img_arr.astype('uint8'))
-		im.save(path, format='JPEG', quality=85)
-		app.logger.debug('save_debug_image: saved %s', path)
+		else:
+			try:
+				conn.close()
+			except Exception:
+				pass
 	except Exception:
 		try:
-			app.logger.exception('save_debug_image failed')
+			conn.close()
 		except Exception:
 			pass
 
 
-def _get_actor_user_id():
-	"""Return the actor user id provided by the caller.
+def normalize_public_url(pu) -> str:
+	"""Normalize Supabase storage URL results into a usable string.
 
-	Checks the `X-User-Id` header first, then JSON/form fields `actor_user_id` or `user_id`.
-	Returns None when not present.
+	Accepts either a dict response (older/newer SDKs) or a plain string.
+	Strips whitespace and a trailing lone "?" that some SDK calls return.
+	Returns empty string when the value is missing or clearly invalid.
 	"""
-	try:
-		# Header (preferred)
-		h = request.headers.get('X-User-Id') or request.headers.get('x-user-id')
-		if h:
-			return h
-		# JSON body or form
-		try:
-			payload = request.get_json(force=False, silent=True)
-		except Exception:
-			payload = None
-		if payload and isinstance(payload, dict):
-			return payload.get('actor_user_id') or payload.get('user_id')
-		# fallback to form data
-		try:
-			form = request.form.to_dict() if request.form else {}
-			return form.get('actor_user_id') or form.get('user_id')
-		except Exception:
-			return None
-	except Exception:
-		return None
+	if pu is None:
+		return ''
+	# If SDK returns a dict, try common keys for public/signed URLs
+	if isinstance(pu, dict):
+		for key in ('publicURL', 'public_url', 'publicUrl', 'signedURL', 'signed_url', 'signedUrl', 'url'):
+			v = pu.get(key)
+			if v:
+				pu = v
+				break
+		else:
+			# fallback to first value
+			values = [v for v in pu.values() if v]
+			pu = values[0] if values else ''
+
+	s = '' if pu is None else str(pu).strip()
+	if not s:
+		return ''
+
+	# Some Supabase responses append a trailing '?' with empty query; remove it.
+	if s.endswith('?'):
+		s = s[:-1].rstrip()
+
+	# Guard against placeholder strings
+	if s.lower() in ('not_found', 'none', 'null', ''):
+		return ''
+
+	return s
 
 
 def decode_base64_image(data_url: str) -> Tuple[np.ndarray, bytes]:
-	"""Decode a data URL or raw base64 image string into (numpy array, raw bytes).
+	if ',' not in data_url:
+		raise ValueError('invalid data URL')
+	_, b64 = data_url.split(',', 1)
+	img_bytes = base64.b64decode(b64)
+	img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+	arr = np.array(img)
+	return arr, img_bytes
 
-	Supports inputs like:
-	- "data:image/jpeg;base64,/9j/4AAQ..."
-	- the raw base64 payload ("/9j/4AAQ...")
 
-	Returns:
-	- (image_array, image_bytes)
-	
-	Raises a ValueError on invalid input or decode failure.
-	"""
-	if not data_url:
-		raise ValueError('empty image data')
-	if not isinstance(data_url, str):
-		raise ValueError('data_url must be a string')
-	# strip whitespace
-	s = data_url.strip()
-	# If it's a data URL like data:<mime>;base64,<payload>
-	if s.startswith('data:'):
-		try:
-			header, b64 = s.split(',', 1)
-		except Exception:
-			raise ValueError('invalid data URL')
-	else:
-		b64 = s
-	# Some clients may include URL-safe base64 or stray whitespace/newlines
+def save_debug_image(prefix: str, img_arr) -> None:
 	try:
-		img_bytes = base64.b64decode(b64, validate=False)
+		name = f"{prefix}_{uuid.uuid4().hex}.jpg"
+		Image.fromarray(img_arr).save(os.path.join(DEBUG_DIR, name))
 	except Exception:
-		# Try a more permissive urlsafe decode as fallback
-		try:
-			import base64 as _b64
-			img_bytes = _b64.urlsafe_b64decode(b64 + '==')
-		except Exception as exc:
-			raise ValueError('base64 decode failed: %s' % exc)
-	# Load image into PIL and convert to RGB numpy array
-	try:
-		img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-		arr = np.array(img)
-		return arr, img_bytes
-	except Exception as exc:
-		raise ValueError('failed to parse image bytes: %s' % exc)
+		app.logger.exception('failed to persist debug image')
 
 
 def ensure_storage_ready():
-	"""Ensure Supabase storage client and bucket are configured."""
 	if not sb or not SUPABASE_BUCKET:
 		raise RuntimeError('Supabase storage not configured; check SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_BUCKET')
-
-
-def normalize_public_url(resp) -> str:
-	"""Normalize various Supabase SDK/storage responses into a public URL string.
-
-	Accepts:
-	- plain string URL
-	- dict returned by Supabase Python/JS SDK (keys like 'publicURL','publicUrl','signedURL','signedUrl')
-	- nested dicts under 'data'
-	Returns empty string when no usable URL found.
-	"""
-	try:
-		if not resp:
-			return ''
-
-		# string directly
-		if isinstance(resp, str):
-			return resp
-		# bytes
-		if isinstance(resp, (bytes, bytearray)):
-			try:
-				s = resp.decode('utf-8')
-				return s if s.startswith('http') else ''
-			except Exception:
-				return ''
-		# dict-like
-		if isinstance(resp, dict):
-			# common keys
-			for key in ('signedURL', 'signedUrl', 'publicURL', 'publicUrl', 'url'):
-				val = resp.get(key)
-				if isinstance(val, str) and val:
-					return val
-			# sometimes SDK wraps result in 'data'
-			data = resp.get('data')
-			if isinstance(data, str) and data.startswith('http'):
-				return data
-			if isinstance(data, dict):
-				for key in ('signedURL', 'signedUrl', 'publicURL', 'publicUrl', 'url'):
-					val = data.get(key)
-					if isinstance(val, str) and val:
-						return val
-			# fallback: search any nested string values
-			for v in resp.values():
-				if isinstance(v, str) and v.startswith('http'):
-					return v
-				if isinstance(v, dict):
-					for vv in v.values():
-						if isinstance(vv, str) and vv.startswith('http'):
-							return vv
-		# fallback to string representation
-		s = str(resp)
-		if s.startswith('http'):
-			return s
-	except Exception:
-		pass
-	return ''
-
-
-@app.route('/api/users/<user_id>/medications', methods=['POST'])
-def api_create_medication(user_id):
-		"""Create a medication record for the user. Owner-only."""
-		actor = _get_actor_user_id()
-		if not actor or str(actor) != str(user_id):
-			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
-
-		payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
-		name = payload.get('name') or payload.get('medication_name')
-		if not name:
-			return jsonify({'ok': False, 'error': 'missing_name'}), 400
-		dosage = payload.get('dosage')
-		frequency = payload.get('frequency')
-		time_val = payload.get('time') or payload.get('when')
-		instructions = payload.get('instructions')
-
-		try:
-			conn = get_db_conn()
-			cur = conn.cursor()
-			cur.execute(
-				"INSERT INTO public.user_medications (user_id, name, dosage, frequency, time, instructions) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id, created_at, updated_at",
-				(user_id, name, dosage, frequency, time_val, instructions),
-			)
-			row = cur.fetchone()
-			conn.commit()
-			med = {
-				'id': str(row[0]),
-				'user_id': user_id,
-				'name': name,
-				'dosage': dosage,
-				'frequency': frequency,
-				'time': time_val,
-				'instructions': instructions,
-				'created_at': row[1].isoformat() if getattr(row[1], 'isoformat', None) else str(row[1]),
-				'updated_at': row[2].isoformat() if getattr(row[2], 'isoformat', None) else str(row[2]),
-			}
-			cur.close()
-			conn.close()
-			return jsonify({'ok': True, 'medication': med}), 201
-		except Exception as exc:
-			app.logger.exception('create_medication: db error')
-			try:
-				conn.rollback()
-			except Exception:
-				pass
-			try:
-				cur.close()
-			except Exception:
-				pass
-			try:
-				conn.close()
-			except Exception:
-				pass
-			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-
-
-@app.route('/api/users/<user_id>/medications/<med_id>', methods=['PUT'])
-def api_update_medication(user_id, med_id):
-		"""Update a medication record for the user. Owner-only."""
-		actor = _get_actor_user_id()
-		if not actor or str(actor) != str(user_id):
-			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
-
-		payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
-		allowed = ['name', 'dosage', 'frequency', 'time', 'instructions']
-		updates = {}
-		for k in allowed:
-			if k in payload:
-				updates[k] = payload.get(k)
-
-		if not updates:
-			return jsonify({'ok': False, 'error': 'no_updates'}), 400
-
-		try:
-			conn = get_db_conn()
-			cur = conn.cursor()
-			set_clauses = []
-			params = []
-			for k, v in updates.items():
-				set_clauses.append(f"{k} = %s")
-				params.append(v)
-			params.extend([med_id, user_id])
-			sql = f"UPDATE public.user_medications SET {', '.join(set_clauses)}, updated_at = now() WHERE id = %s AND user_id = %s RETURNING id, name, dosage, frequency, time, instructions, updated_at"
-			cur.execute(sql, tuple(params))
-			row = cur.fetchone()
-			if not row:
-				conn.rollback()
-				cur.close()
-				conn.close()
-				return jsonify({'ok': False, 'error': 'medication_missing'}), 404
-			conn.commit()
-			med = {
-				'id': str(row[0]),
-				'name': row[1],
-				'dosage': row[2],
-				'frequency': row[3],
-				'time': row[4],
-				'instructions': row[5],
-				'updated_at': row[6].isoformat() if getattr(row[6], 'isoformat', None) else str(row[6]),
-			}
-			cur.close()
-			conn.close()
-			return jsonify({'ok': True, 'medication': med}), 200
-		except Exception as exc:
-			app.logger.exception('update_medication: db error')
-			try:
-				conn.rollback()
-			except Exception:
-				pass
-			try:
-				cur.close()
-			except Exception:
-				pass
-			try:
-				conn.close()
-			except Exception:
-				pass
-			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-
-
-@app.route('/api/users/<user_id>/medications/<med_id>', methods=['DELETE'])
-def api_delete_medication(user_id, med_id):
-		"""Delete a medication record for the user. Owner-only."""
-		actor = _get_actor_user_id()
-		if not actor or str(actor) != str(user_id):
-			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
-
-		try:
-			conn = get_db_conn()
-			cur = conn.cursor()
-			cur.execute("DELETE FROM public.user_medications WHERE id = %s AND user_id = %s RETURNING id", (med_id, user_id))
-			row = cur.fetchone()
-			if not row:
-				conn.rollback()
-				cur.close()
-				conn.close()
-				return jsonify({'ok': False, 'error': 'medication_missing'}), 404
-			conn.commit()
-			cur.close()
-			conn.close()
-			return jsonify({'ok': True}), 200
-		except Exception as exc:
-			app.logger.exception('delete_medication: db error')
-			try:
-				conn.rollback()
-			except Exception:
-				pass
-			try:
-				cur.close()
-			except Exception:
-				pass
-			try:
-				conn.close()
-			except Exception:
-				pass
-			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
 def _public_or_signed_url(path: str) -> str:
@@ -727,7 +566,6 @@ def signup():
 	if tmpl and os.path.exists(page):
 		return render_template('welcome.html')
 	return render_template('index.html') if os.path.exists(os.path.join(tmpl, 'index.html')) else 'Signup'
-
 
 
 
@@ -974,45 +812,9 @@ def api_capture_face():
 			cur.close()
 			conn.close()
 			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-        
-	@app.route('/api/users/<user_id>/medications/<med_id>', methods=['DELETE'])
-	def api_delete_medication(user_id, med_id):
-		"""Delete a medication record for the user. Owner-only."""
-		actor = _get_actor_user_id()
-		if not actor or str(actor) != str(user_id):
-			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
-
-		try:
-			conn = get_db_conn()
-			cur = conn.cursor()
-			cur.execute("DELETE FROM public.user_medications WHERE id = %s AND user_id = %s RETURNING id", (med_id, user_id))
-			row = cur.fetchone()
-			if not row:
-				conn.rollback()
-				cur.close()
-				conn.close()
-				return jsonify({'ok': False, 'error': 'medication_missing'}), 404
-			conn.commit()
+		finally:
 			cur.close()
 			conn.close()
-			return jsonify({'ok': True}), 200
-		except Exception as exc:
-			app.logger.exception('delete_medication: db error')
-			try:
-				conn.rollback()
-			except Exception:
-				pass
-			try:
-				cur.close()
-			except Exception:
-				pass
-			try:
-				conn.close()
-			except Exception:
-				pass
-			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-
-	# end nested medication handler (moved to top-level)
 
 	conn = get_db_conn()
 	cur = conn.cursor()
@@ -1169,59 +971,8 @@ def api_register():
 		conn.close()
 
 	# If the client provided an image data URL or temp path, attach it to the user and insert embedding
-	# Also persist provided `medications` into `public.user_medications` table
-	if medications:
-		try:
-			med_conn = get_db_conn()
-			med_cur = med_conn.cursor()
-			for m in medications:
-				name = None
-				dosage = None
-				frequency = None
-				time_of_day = None
-				instructions = None
-				if isinstance(m, str):
-					name = m.strip()
-				elif isinstance(m, dict):
-					name = m.get('name') or m.get('medication') or None
-					dosage = m.get('dosage')
-					frequency = m.get('frequency')
-					time_of_day = m.get('time') or m.get('time_of_day')
-					instructions = m.get('instructions') or m.get('notes')
-				else:
-					# fallback: stringify
-					name = str(m)
-				if not name:
-					continue
-				try:
-					med_cur.execute(
-						"""
-						INSERT INTO public.user_medications (user_id, name, dosage, frequency, time, instructions, created_at, updated_at)
-						VALUES (%s, %s, %s, %s, %s, %s, now(), now())
-						""",
-						(user_id, name, dosage, frequency, time_of_day, instructions),
-					)
-				except Exception:
-					app.logger.exception('register: failed to insert one medication, continuing')
-			med_conn.commit()
-		except Exception:
-			try:
-				med_conn.rollback()
-			except Exception:
-				pass
-			app.logger.exception('register: failed to insert medications')
-		finally:
-			try:
-				med_cur.close()
-				med_conn.close()
-			except Exception:
-				pass
 	image_data_url = payload.get('image') or payload.get('face_image') or payload.get('image_url')
 	temp_path = payload.get('temp_storage_path') or payload.get('temp_path')
-	image_saved = False
-	embedding_saved = False
-	public_url = None
-	storage_path = None
 	if image_data_url or temp_path:
 		try:
 			if image_data_url:
@@ -1285,7 +1036,6 @@ def api_register():
 						len(img_bytes),
 					),
 				)
-				image_saved = True
 				# Try to compute encoding and insert embedding separately
 				# This is optional - registration succeeds even without face encoding
 				encoding = compute_face_encoding(img_arr)
@@ -1293,32 +1043,8 @@ def api_register():
 					try:
 						insert_embedding(cur, user_id, encoding, 'register')
 						app.logger.info('register: embedding inserted successfully')
-						embedding_saved = True
 					except Exception:
-						app.logger.exception('register: failed to insert embedding into primary cursor')
-						# fallback: try inserting using a separate connection
-						try:
-							alt_conn = get_db_conn()
-							alt_cur = alt_conn.cursor()
-							try:
-								insert_embedding(alt_cur, user_id, encoding, 'register-fallback')
-								alt_conn.commit()
-								embedding_saved = True
-							except Exception:
-								try:
-									alt_conn.rollback()
-								except Exception:
-									pass
-								app.logger.exception('register: fallback embedding insert failed')
-							finally:
-								try:
-									alt_cur.close()
-									alt_conn.close()
-								except Exception:
-									pass
-						except Exception:
-							# fallback connection creation failed
-							app.logger.exception('register: could not open fallback DB connection for embedding')
+						app.logger.warning('register: failed to insert embedding, continuing')
 				else:
 					app.logger.warning('register: no encoding computed (face_recognition unavailable or no face)')
 				conn.commit()
@@ -1331,14 +1057,7 @@ def api_register():
 		except Exception:
 			app.logger.exception('register: image handling failed')
 
-	resp = {'ok': True, 'user_id': str(user_id), 'display_name': display_name}
-	resp['image_saved'] = image_saved
-	if public_url:
-		resp['public_url'] = public_url
-	if storage_path:
-		resp['storage_path'] = storage_path
-	resp['embedding_saved'] = embedding_saved
-	return jsonify(resp), 201
+	return jsonify({'ok': True, 'user_id': str(user_id), 'display_name': display_name}), 201
 
 
 # Legacy POST /signup route used by the web client (form POST)
@@ -1697,22 +1416,19 @@ def api_admin_embeddings():
 @app.route('/api/users/<user_id>', methods=['GET'])
 def api_get_user(user_id):
 	"""Return user record, images and embedding metadata."""
-	conn = None
-	cur = None
+	# Only allow the owner (actor) to read this user's details
+	actor = _get_actor_user_id()
+	if not actor or str(actor) != str(user_id):
+		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
 	try:
 		conn = get_db_conn()
 		cur = conn.cursor()
-		cur.execute(
-			"""
-			SELECT id, display_name, username, email, phone, date_of_birth, emergency_contact,
-			       medications, allergies, accessibility_needs, preferred_language, created_at
-			FROM public.users
-			WHERE id = %s
-			""",
-			(user_id,),
-		)
+		cur.execute("SELECT id, display_name, username, email, phone, date_of_birth, emergency_contact, medications, allergies, accessibility_needs, preferred_language, created_at FROM public.users WHERE id = %s", (user_id,))
 		row = cur.fetchone()
 		if not row:
+			cur.close()
+			conn.close()
 			return jsonify({'ok': False, 'error': 'user_missing'}), 404
 
 		user = {
@@ -1727,47 +1443,31 @@ def api_get_user(user_id):
 			'allergies': row[8],
 			'accessibility_needs': row[9],
 			'preferred_language': row[10],
-			'created_at': row[11].isoformat() if getattr(row[11], 'isoformat', None) else str(row[11]),
+			'created_at': row[11].isoformat() if getattr(row[11], 'isoformat', None) else str(row[11])
 		}
 
-		# fetch user images
 		cur.execute("SELECT id, storage_path, public_url, is_profile, uploaded_at FROM public.user_images WHERE user_id = %s ORDER BY uploaded_at DESC", (user_id,))
 		images = []
 		for r in cur.fetchall():
-			images.append({
-				'id': str(r[0]),
-				'storage_path': r[1],
-				'public_url': r[2],
-				'is_profile': bool(r[3]),
-				'uploaded_at': r[4].isoformat() if getattr(r[4], 'isoformat', None) else str(r[4]),
-			})
+			images.append({'id': str(r[0]), 'storage_path': r[1], 'public_url': r[2], 'is_profile': bool(r[3]), 'uploaded_at': r[4].isoformat() if getattr(r[4], 'isoformat', None) else str(r[4])})
 
-		# count embeddings
 		cur.execute("SELECT count(*) FROM public.embeddings WHERE user_id = %s", (user_id,))
 		emb_count = cur.fetchone()[0]
 
+		cur.close()
+		conn.close()
 		return jsonify({'ok': True, 'user': user, 'images': images, 'embedding_count': int(emb_count)}), 200
 	except Exception as exc:
 		app.logger.exception('get_user: db error')
+		try:
+			cur.close()
+		except Exception:
+			pass
+		try:
+			conn.close()
+		except Exception:
+			pass
 		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-	finally:
-		try:
-			if cur:
-				cur.close()
-		except Exception:
-			pass
-		try:
-			if conn:
-				try:
-					# prefer pool release if available
-					release_db_conn(conn)
-				except Exception:
-					try:
-						conn.close()
-					except Exception:
-						pass
-		except Exception:
-			pass
 
 
 @app.route('/api/users/<user_id>', methods=['PUT'])
@@ -1955,261 +1655,225 @@ def api_delete_image(image_id):
 		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
+
+# ============ MEDICATION CRUD ENDPOINTS ============
+
+
 @app.route('/api/users/<user_id>/medications', methods=['GET'])
 def api_list_medications(user_id):
-	"""List all medications for a user."""
-	conn = None
-	cur = None
-	try:
-		conn = get_db_conn()
-		cur = conn.cursor()
-		cur.execute(
-			"""
-			SELECT id, name, dosage, frequency, "time", instructions, created_at, updated_at
-			FROM public.user_medications
-			WHERE user_id = %s
-			ORDER BY created_at DESC
-			""",
-			(user_id,)
-		)
-		rows = cur.fetchall()
-		items = []
-		for r in rows:
-			items.append({
-				'id': str(r[0]),
-				'name': r[1],
-				'dosage': r[2],
-				'frequency': r[3],
-				'time': r[4],
-				'instructions': r[5],
-				'created_at': r[6].isoformat() if getattr(r[6], 'isoformat', None) else str(r[6]),
-				'updated_at': r[7].isoformat() if getattr(r[7], 'isoformat', None) else str(r[7]),
-			})
-		return jsonify({'ok': True, 'count': len(items), 'items': items}), 200
-	except Exception as exc:
-		app.logger.exception('list_medications: db error')
-		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-	finally:
-		try:
-			if cur:
-				cur.close()
-		except Exception:
-			pass
-		try:
-			if conn:
-				# return to pool or close
-				try:
-					release_db_conn(conn)
-				except Exception:
-					try:
-						conn.close()
-					except Exception:
-						pass
-		except Exception:
-			pass
+    """List all medications for a user."""
+    conn = None
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, name, dosage, frequency, time, instructions, created_at, updated_at
+            FROM public.user_medications
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+        """, (user_id,))
+        rows = cur.fetchall()
+        cur.close()
+
+        items = []
+        for row in rows:
+            items.append({
+                'id': str(row[0]),
+                'name': row[1],
+                'dosage': row[2],
+                'frequency': row[3],
+                'time': row[4],
+                'instructions': row[5],
+                'created_at': row[6].isoformat() if row[6] else None,
+                'updated_at': row[7].isoformat() if row[7] else None,
+            })
+
+        conn.close()
+        return jsonify({'ok': True, 'count': len(items), 'items': items}), 200
+    except Exception as exc:
+        app.logger.exception('list_medications: error')
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
 
 
 @app.route('/api/users/<user_id>/medications', methods=['POST'])
 def api_create_medication(user_id):
-	"""Create a new medication for a user (owner-only)."""
-	actor = _get_actor_user_id()
-	if not actor or str(actor) != str(user_id):
-		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+    """Create a new medication for a user."""
+    actor = _get_actor_user_id()
+    if not actor or str(actor) != str(user_id):
+        return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
 
-	payload = request.get_json(force=True, silent=True) or {}
-	name = (payload.get('name') or payload.get('medication_name') or '').strip()
-	if not name:
-		return jsonify({'ok': False, 'error': 'missing_name'}), 400
-	dosage = payload.get('dosage')
-	frequency = payload.get('frequency')
-	time_val = payload.get('time') or payload.get('when')
-	instructions = payload.get('instructions')
+    payload = request.get_json(force=True, silent=True) or {}
+    name = (payload.get('name') or '').strip()
+    if not name:
+        return jsonify({'ok': False, 'error': 'missing_name'}), 400
 
-	conn = None
-	cur = None
-	try:
-		conn = get_db_conn()
-		cur = conn.cursor()
-		cur.execute(
-			"""
-			INSERT INTO public.user_medications (user_id, name, dosage, frequency, "time", instructions)
-			VALUES (%s, %s, %s, %s, %s, %s)
-			RETURNING id, user_id, name, dosage, frequency, "time", instructions, created_at, updated_at
-			""",
-			(user_id, name, dosage, frequency, time_val, instructions),
-		)
-		row = cur.fetchone()
-		conn.commit()
-		medication = {
-			'id': str(row[0]),
-			'user_id': str(row[1]),
-			'name': row[2],
-			'dosage': row[3],
-			'frequency': row[4],
-			'time': row[5],
-			'instructions': row[6],
-			'created_at': row[7].isoformat() if getattr(row[7], 'isoformat', None) else str(row[7]),
-			'updated_at': row[8].isoformat() if getattr(row[8], 'isoformat', None) else str(row[8]),
-		}
-		return jsonify({'ok': True, 'medication': medication}), 201
-	except Exception as exc:
-		app.logger.exception('create_medication: db error')
-		if conn:
-			try:
-				conn.rollback()
-			except Exception:
-				pass
-		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-	finally:
-		try:
-			if cur:
-				cur.close()
-		except Exception:
-			pass
-		try:
-			if conn:
-				try:
-					release_db_conn(conn)
-				except Exception:
-					try:
-						conn.close()
-					except Exception:
-						pass
-		except Exception:
-			pass
+    dosage = payload.get('dosage')
+    frequency = payload.get('frequency')
+    time_val = payload.get('time')
+    instructions = payload.get('instructions')
+
+    conn = None
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO public.user_medications (user_id, name, dosage, frequency, time, instructions)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id, user_id, name, dosage, frequency, time, instructions, created_at, updated_at
+        """, (user_id, name, dosage, frequency, time_val, instructions))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        medication = {
+            'id': str(row[0]),
+            'user_id': str(row[1]),
+            'name': row[2],
+            'dosage': row[3],
+            'frequency': row[4],
+            'time': row[5],
+            'instructions': row[6],
+            'created_at': row[7].isoformat() if row[7] else None,
+            'updated_at': row[8].isoformat() if row[8] else None,
+        }
+
+        return jsonify({'ok': True, 'medication': medication}), 201
+    except Exception as exc:
+        app.logger.exception('create_medication: error')
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
 
 
 @app.route('/api/users/<user_id>/medications/<med_id>', methods=['PUT'])
 def api_update_medication(user_id, med_id):
-	"""Update a medication. Owner-only."""
-	actor = _get_actor_user_id()
-	if not actor or str(actor) != str(user_id):
-		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+    """Update a medication."""
+    actor = _get_actor_user_id()
+    if not actor or str(actor) != str(user_id):
+        return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
 
-	payload = request.get_json(force=True, silent=True) or {}
-	allowed_fields = ['name', 'dosage', 'frequency', 'time', 'instructions']
-	set_clauses = []
-	params = []
-	for field in allowed_fields:
-		if field in payload:
-			if field == 'time':
-				set_clauses.append('"time" = %s')
-			else:
-				set_clauses.append(f"{field} = %s")
-			params.append(payload[field])
+    payload = request.get_json(force=True, silent=True) or {}
 
-	if not set_clauses:
-		return jsonify({'ok': False, 'error': 'no_updates'}), 400
+    allowed_fields = ['name', 'dosage', 'frequency', 'time', 'instructions']
+    set_clauses = []
+    params = []
 
-	params.extend([med_id, user_id])
-	conn = None
-	cur = None
-	try:
-		conn = get_db_conn()
-		cur = conn.cursor()
-		sql = f"""
-			UPDATE public.user_medications
-			SET {', '.join(set_clauses)}, updated_at = now()
-			WHERE id = %s AND user_id = %s
-			RETURNING id, name, dosage, frequency, "time", instructions, updated_at
-		"""
-		cur.execute(sql, tuple(params))
-		row = cur.fetchone()
-		if not row:
-			try:
-				conn.rollback()
-			except Exception:
-				pass
-			return jsonify({'ok': False, 'error': 'medication_missing'}), 404
-		conn.commit()
-		medication = {
-			'id': str(row[0]),
-			'name': row[1],
-			'dosage': row[2],
-			'frequency': row[3],
-			'time': row[4],
-			'instructions': row[5],
-			'updated_at': row[6].isoformat() if getattr(row[6], 'isoformat', None) else str(row[6]),
-		}
-		return jsonify({'ok': True, 'medication': medication}), 200
-	except Exception as exc:
-		app.logger.exception('update_medication: db error')
-		if conn:
-			try:
-				conn.rollback()
-			except Exception:
-				pass
-		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-	finally:
-		try:
-			if cur:
-				cur.close()
-		except Exception:
-			pass
-		try:
-			if conn:
-				try:
-					release_db_conn(conn)
-				except Exception:
-					try:
-						conn.close()
-					except Exception:
-						pass
-		except Exception:
-			pass
+    for field in allowed_fields:
+        if field in payload:
+            set_clauses.append(f"{field} = %s")
+            params.append(payload[field])
+
+    if not set_clauses:
+        return jsonify({'ok': False, 'error': 'no_updates'}), 400
+
+    set_clauses.append("updated_at = NOW()")
+    params.extend([med_id, user_id])
+
+    conn = None
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        sql = f"""
+            UPDATE public.user_medications
+            SET {', '.join(set_clauses)}
+            WHERE id = %s AND user_id = %s
+            RETURNING id, name, dosage, frequency, time, instructions, updated_at
+        """
+        cur.execute(sql, tuple(params))
+        row = cur.fetchone()
+
+        if not row:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'error': 'medication_missing'}), 404
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        medication = {
+            'id': str(row[0]),
+            'name': row[1],
+            'dosage': row[2],
+            'frequency': row[3],
+            'time': row[4],
+            'instructions': row[5],
+            'updated_at': row[6].isoformat() if row[6] else None,
+        }
+
+        return jsonify({'ok': True, 'medication': medication}), 200
+    except Exception as exc:
+        app.logger.exception('update_medication: error')
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
 
 
 @app.route('/api/users/<user_id>/medications/<med_id>', methods=['DELETE'])
 def api_delete_medication(user_id, med_id):
-	"""Delete a medication. Owner-only."""
-	actor = _get_actor_user_id()
-	if not actor or str(actor) != str(user_id):
-		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+    """Delete a medication."""
+    actor = _get_actor_user_id()
+    if not actor or str(actor) != str(user_id):
+        return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
 
-	conn = None
-	cur = None
-	try:
-		conn = get_db_conn()
-		cur = conn.cursor()
-		cur.execute("""
-			DELETE FROM public.user_medications
-			WHERE id = %s AND user_id = %s
-			RETURNING id
-		""", (med_id, user_id))
-		row = cur.fetchone()
-		if not row:
-			try:
-				conn.rollback()
-			except Exception:
-				pass
-			return jsonify({'ok': False, 'error': 'medication_missing'}), 404
-		conn.commit()
-		return jsonify({'ok': True}), 200
-	except Exception as exc:
-		app.logger.exception('delete_medication: db error')
-		if conn:
-			try:
-				conn.rollback()
-			except Exception:
-				pass
-		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-	finally:
-		try:
-			if cur:
-				cur.close()
-		except Exception:
-			pass
-		try:
-			if conn:
-				try:
-					release_db_conn(conn)
-				except Exception:
-					try:
-						conn.close()
-					except Exception:
-						pass
-		except Exception:
-			pass
+    conn = None
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            DELETE FROM public.user_medications
+            WHERE id = %s AND user_id = %s
+            RETURNING id
+        """, (med_id, user_id))
+        row = cur.fetchone()
+
+        if not row:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'error': 'medication_missing'}), 404
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return jsonify({'ok': True}), 200
+    except Exception as exc:
+        app.logger.exception('delete_medication: error')
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
 if __name__ == '__main__':
