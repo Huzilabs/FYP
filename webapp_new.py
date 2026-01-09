@@ -1838,6 +1838,31 @@ except Exception:
 @app.route('/api/users/<user_id>/medications', methods=['POST'])
 def api_create_medication(user_id):
     """Create a medication for a user."""
+    try:
+        app.logger.debug('create_med handler content_type=%r', request.content_type)
+        app.logger.debug('create_med handler headers=%s', dict(request.headers))
+        raw = request.get_data(cache=True)
+        app.logger.debug('create_med handler raw_body_len=%d preview=%r', len(raw), raw[:200])
+    except Exception:
+        app.logger.exception('create_med: failed to log raw request')
+
+    # Also persist raw request to disk for debugging when running in a background terminal
+    try:
+        debug_path = os.path.join(DEBUG_DIR, 'create_med_debug.txt')
+        with open(debug_path, 'ab') as df:
+            df.write(b'---REQUEST---\n')
+            df.write(b'Content-Type: ' + (request.content_type or '').encode('utf-8') + b'\n')
+            for k, v in dict(request.headers).items():
+                try:
+                    df.write(f"{k}: {v}\n".encode('utf-8'))
+                except Exception:
+                    pass
+            df.write(b'BODY:\n')
+            df.write(raw or b'')
+            df.write(b'\n---END---\n')
+    except Exception:
+        app.logger.exception('create_med: failed to write debug file')
+
     payload = request.get_json(force=True, silent=True) or {}
     name = (payload.get('name') or '').strip()
     if not name:
