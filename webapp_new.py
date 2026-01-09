@@ -8,6 +8,8 @@ from typing import Tuple, Optional
 from flask import Flask, jsonify, render_template, request
 from flask_cors import CORS
 from PIL import Image
+from contextlib import contextmanager
+import threading
 from dotenv import load_dotenv
 import logging
 import sys
@@ -23,12 +25,12 @@ SUPABASE_BUCKET = os.getenv('SUPABASE_BUCKET')
 
 sb = None
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
-	try:
-		from supabase import create_client
+    try:
+        from supabase import create_client
 
-		sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-	except Exception:
-		sb = None
+        sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    except Exception:
+        sb = None
 
 APP_ROOT = os.path.dirname(__file__)
 DATA_DIR = os.path.join(APP_ROOT, 'data')
@@ -53,59 +55,55 @@ app.logger.setLevel(logging.DEBUG)
 
 @app.before_request
 def _handle_cors_preflight():
-	"""Handle CORS preflight OPTIONS requests."""
-	if request.method == 'OPTIONS':
-		response = jsonify({'ok': True})
-		response.status_code = 200
-		return _set_cors_headers(response)
+    """Handle CORS preflight OPTIONS requests."""
+    if request.method == 'OPTIONS':
+        response = jsonify({'ok': True})
+        response.status_code = 200
+        return _set_cors_headers(response)
 
 
 @app.after_request
 def _set_cors_headers(response):
-	"""Add CORS headers to all responses for localhost:3000."""
-	origin = request.headers.get('Origin', '')
-	# Allow all origins by default (permssive). If you want to restrict to specific
-	# origins in production, check and only set the header for those origins.
-	if origin:
-		response.headers['Access-Control-Allow-Origin'] = origin
-	else:
-		response.headers['Access-Control-Allow-Origin'] = '*'
-	response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS,HEAD'
-	response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,X-User-Id'
-	response.headers['Access-Control-Allow-Credentials'] = 'true'
-	response.headers['Access-Control-Max-Age'] = '3600'
-	return response
+    """Add CORS headers to all responses for localhost:3000."""
+    origin = request.headers.get('Origin', '')
+    # Allow all origins by default (permssive). If you want to restrict to specific
+    # origins in production, check and only set the header for those origins.
+    if origin:
+        response.headers['Access-Control-Allow-Origin'] = origin
+    else:
+        response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS,HEAD'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,X-User-Id'
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    response.headers['Access-Control-Max-Age'] = '3600'
+    return response
 
 # Cache whether pgvector `vector` type exists to avoid repeated checks
 _HAS_VECTOR = None
+# Lock to serialize first-time vector detection and avoid exhausting DB pool
+_vector_detect_lock = threading.Lock()
 
 
 def _detect_vector_type() -> bool:
-	global _HAS_VECTOR
-	# If we've previously determined pgvector exists, return cached True immediately.
-	if _HAS_VECTOR is True:
-		return True
-	# Otherwise, re-check the DB (this allows a prior False cache to be re-evaluated
-	# after migrations or admin changes).
-	try:
-		conn = None
-		try:
-			conn = get_db_conn()
-			cur = conn.cursor()
-			# Check both pg_extension (installation) and pg_type (type existence with schema)
-			cur.execute("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector') OR EXISTS(SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'vector')")
-			_HAS_VECTOR = bool(cur.fetchone()[0])
-			cur.close()
-		finally:
-			try:
-				if conn:
-					conn.close()
-			except Exception:
-				pass
-	except Exception:
-		app.logger.exception('error detecting pgvector type')
-		_HAS_VECTOR = False
-	return _HAS_VECTOR
+    global _HAS_VECTOR
+    # Fast path: cached positive result
+    if _HAS_VECTOR is True:
+        return True
+
+    # Serialize detection so multiple threads don't exhaust the pool on first call
+    with _vector_detect_lock:
+        if _HAS_VECTOR is True:
+            return True
+        try:
+            with db_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector') OR EXISTS(SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'vector')")
+                _HAS_VECTOR = bool(cur.fetchone()[0])
+                cur.close()
+        except Exception:
+            app.logger.exception('error detecting pgvector type')
+            _HAS_VECTOR = False
+    return _HAS_VECTOR
 
 
 # Cache the schema name that contains the `vector` type (pgvector)
@@ -116,1543 +114,1658 @@ _DB_POOL = None
 
 
 def _detect_vector_schema() -> Optional[str]:
-	"""Return the schema name that contains the `vector` type, or None if not found.
+    """Return the schema name that contains the `vector` type, or None if not found.
 
-	This is used to construct schema-qualified casts like `schema.vector(128)` when
-	the extension is installed into a non-public schema (e.g. `vector_ext`).
-	The result is cached in `_VECTOR_SCHEMA` but will be rechecked if None.
-	"""
-	global _VECTOR_SCHEMA
-	if _VECTOR_SCHEMA is not None:
-		return _VECTOR_SCHEMA
-	try:
-		conn = get_db_conn()
-		cur = conn.cursor()
-		# Find the namespace (schema) that defines a type named 'vector'
-		cur.execute("""
-			SELECT n.nspname
-			FROM pg_type t
-			JOIN pg_namespace n ON t.typnamespace = n.oid
-			WHERE t.typname = 'vector'
-			LIMIT 1
-		""")
-		row = cur.fetchone()
-		cur.close()
-		try:
-			conn.close()
-		except Exception:
-			pass
-		if row and row[0]:
-			_VECTOR_SCHEMA = row[0]
-			return _VECTOR_SCHEMA
-	except Exception:
-		app.logger.debug('could not detect vector schema')
-	_VECTOR_SCHEMA = None
-	return None
+    This is used to construct schema-qualified casts like `schema.vector(128)` when
+    the extension is installed into a non-public schema (e.g. `vector_ext`).
+    The result is cached in `_VECTOR_SCHEMA` but will be rechecked if None.
+    """
+    global _VECTOR_SCHEMA
+    if _VECTOR_SCHEMA is not None:
+        return _VECTOR_SCHEMA
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        # Find the namespace (schema) that defines a type named 'vector'
+        cur.execute("""
+            SELECT n.nspname
+            FROM pg_type t
+            JOIN pg_namespace n ON t.typnamespace = n.oid
+            WHERE t.typname = 'vector'
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+        cur.close()
+        try:
+            release_db_conn(conn)
+        except Exception:
+            try:
+                release_db_conn(conn)
+            except Exception:
+                pass
+        if row and row[0]:
+            _VECTOR_SCHEMA = row[0]
+            return _VECTOR_SCHEMA
+    except Exception:
+        app.logger.debug('could not detect vector schema')
+    _VECTOR_SCHEMA = None
+    return None
 
 
 def coerce_bool(value: Optional[str]) -> bool:
-	if isinstance(value, bool):
-		return value
-	if value is None:
-		return False
-	return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
 def _get_actor_user_id():
-	"""Resolve caller identity for owner-only checks.
+    """Resolve caller identity for owner-only checks.
 
-	This accepts either header `X-User-Id` or form/json field `actor_user_id`.
-	It's a minimal protection mechanism intended for local/dev usage until
-	proper authentication is added (JWT / API key / Supabase auth).
-	"""
-	# Prefer header
-	try:
-		uid = request.headers.get('X-User-Id')
-		if uid:
-			return uid
-	except Exception:
-		pass
-	# Fall back to body param
-	try:
-		payload = request.get_json(silent=True) if request.is_json else request.form.to_dict()
-		if payload:
-			uid = payload.get('actor_user_id') or payload.get('user_id')
-			if uid:
-				return uid
-	except Exception:
-		pass
-	return None
+    This accepts either header `X-User-Id` or form/json field `actor_user_id`.
+    It's a minimal protection mechanism intended for local/dev usage until
+    proper authentication is added (JWT / API key / Supabase auth).
+    """
+    # Prefer header
+    try:
+        uid = request.headers.get('X-User-Id')
+        if uid:
+            return uid
+    except Exception:
+        pass
+    # Fall back to body param
+    try:
+        payload = request.get_json(silent=True) if request.is_json else request.form.to_dict()
+        if payload:
+            uid = payload.get('actor_user_id') or payload.get('user_id')
+            if uid:
+                return uid
+    except Exception:
+        pass
+    return None
 
 
 def get_db_conn():
-	"""Return a DB connection, using a ThreadedConnectionPool when possible.
+    """Return a DB connection, using a ThreadedConnectionPool when possible.
 
-	This function lazily initializes a pool stored in `_DB_POOL`. Connections
-	returned from the pool have their `.close()` monkeypatched to return the
-	connection to the pool so existing code that calls `conn.close()` continues
-	to work.
-	"""
-	global _DB_POOL
-	if not SUPABASE_DB_URL:
-		raise RuntimeError('SUPABASE_DB_URL not set')
-	try:
-		import psycopg2  # type: ignore
-		from psycopg2 import pool as pgpool
-	except Exception as exc:
-		raise RuntimeError('psycopg2 is required: ' + str(exc))
+    This function lazily initializes a pool stored in `_DB_POOL`. Connections
+    returned from the pool have their `.close()` monkeypatched to return the
+    connection to the pool so existing code that calls `conn.close()` continues
+    to work.
+    """
+    global _DB_POOL
+    if not SUPABASE_DB_URL:
+        raise RuntimeError('SUPABASE_DB_URL not set')
+    try:
+        import psycopg2  # type: ignore
+        from psycopg2 import pool as pgpool
+    except Exception as exc:
+        raise RuntimeError('psycopg2 is required: ' + str(exc))
 
-	# Initialize pool lazily
-	if _DB_POOL is None:
-		try:
-			maxconn = int(os.getenv('SUPABASE_DB_MAX_CONN', '10'))
-		except Exception:
-			maxconn = 10
-		try:
-			# ensure sslmode present in DSN
-			dsn = SUPABASE_DB_URL
-			if 'sslmode' not in (dsn or '').lower():
-				if '?' in dsn:
-					dsn = dsn + '&sslmode=require'
-				else:
-					dsn = dsn + '?sslmode=require'
-			_DB_POOL = pgpool.ThreadedConnectionPool(1, maxconn, dsn)
-			app.logger.info('Initialized DB pool (maxconn=%d)', maxconn)
-		except Exception:
-			app.logger.exception('failed to initialize DB pool; falling back to direct connect')
-			_DB_POOL = None
+    # Initialize pool lazily
+    if _DB_POOL is None:
+        try:
+            maxconn = int(os.getenv('SUPABASE_DB_MAX_CONN', '10'))
+        except Exception:
+            maxconn = 10
+        try:
+            # ensure sslmode present in DSN
+            dsn = SUPABASE_DB_URL
+            if 'sslmode' not in (dsn or '').lower():
+                if '?' in dsn:
+                    dsn = dsn + '&sslmode=require'
+                else:
+                    dsn = dsn + '?sslmode=require'
+            _DB_POOL = pgpool.ThreadedConnectionPool(1, maxconn, dsn)
+            app.logger.info('Initialized DB pool (maxconn=%d)', maxconn)
+        except Exception:
+            app.logger.exception('failed to initialize DB pool; falling back to direct connect')
+            _DB_POOL = None
 
-	# If pool is available, getconn; otherwise fall back to direct connect
-	if _DB_POOL:
-		conn = _DB_POOL.getconn()
-	else:
-		conn = psycopg2.connect(SUPABASE_DB_URL)
+    # If pool is available, getconn with retry/backoff; otherwise fall back to direct connect
+    if _DB_POOL:
+        from psycopg2.pool import PoolError
+        conn = None
+        # retry a few times before failing to avoid transient exhaustion
+        for attempt in range(5):
+            try:
+                conn = _DB_POOL.getconn()
+                break
+            except Exception as exc:
+                # handle pool-specific error or retry
+                app.logger.debug('get_db_conn: pool getconn attempt %d failed: %s', attempt, exc)
+                time.sleep(0.05 * (2 ** attempt))
+        if conn is None:
+            raise RuntimeError('DB connection pool exhausted')
+    else:
+        conn = psycopg2.connect(SUPABASE_DB_URL)
 
-	conn.autocommit = False
-	# Prefer vector_ext in the search_path so ::vector casts resolve if pgvector
-	try:
-		cur = conn.cursor()
-		cur.execute("SET search_path = vector_ext, public;")
-		cur.close()
-	except Exception:
-		app.logger.debug('failed to set search_path to include vector_ext')
+    conn.autocommit = False
+    # Prefer vector_ext in the search_path so ::vector casts resolve if pgvector
+    try:
+        cur = conn.cursor()
+        cur.execute("SET search_path = vector_ext, public;")
+        cur.close()
+    except Exception:
+        app.logger.debug('failed to set search_path to include vector_ext')
 
-	# If using a pool, monkeypatch conn.close to return to pool so existing
-	# call sites that call conn.close() won't permanently close the connection.
-	if _DB_POOL:
-		try:
-			orig_close = getattr(conn, 'close', None)
-			def _return_to_pool(*a, **k):
-				try:
-					_DB_POOL.putconn(conn)
-				except Exception:
-					try:
-						if orig_close:
-							orig_close()
-					except Exception:
-						pass
-			conn.close = _return_to_pool
-		except Exception:
-			app.logger.debug('could not monkeypatch conn.close to return to pool')
+    # If using a pool, monkeypatch conn.close to return to pool so existing
+    # call sites that call conn.close() won't permanently close the connection.
+    if _DB_POOL:
+        try:
+            orig_close = getattr(conn, 'close', None)
+            def _return_to_pool(*a, **k):
+                try:
+                    _DB_POOL.putconn(conn)
+                except Exception:
+                    try:
+                        if orig_close:
+                            orig_close()
+                    except Exception:
+                        pass
+            conn.close = _return_to_pool
+        except Exception:
+            app.logger.debug('could not monkeypatch conn.close to return to pool')
 
-	return conn
+    return conn
+
+
+@contextmanager
+def db_conn():
+    """Context manager that yields a DB connection and ensures it is released.
+
+    Use this instead of calling `get_db_conn()` directly to guarantee the
+    connection is returned to the pool even on exceptions.
+    """
+    conn = None
+    try:
+        conn = get_db_conn()
+        yield conn
+    finally:
+        try:
+            release_db_conn(conn)
+        except Exception:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+
+# Per-request connection helper and teardown
+from flask import g
+
+def get_request_conn():
+    if hasattr(g, 'db_conn') and g.db_conn:
+        return g.db_conn
+    g.db_conn = get_db_conn()
+    return g.db_conn
+
+
+@app.teardown_appcontext
+def _teardown_request_conn(exc=None):
+    conn = getattr(g, 'db_conn', None)
+    if conn:
+        try:
+            release_db_conn(conn)
+        except Exception:
+            try:
+                release_db_conn(conn)
+            except Exception:
+                pass
+
 
 
 def release_db_conn(conn):
-	"""Release a connection back to the pool or close it if no pool.
+    """Release a connection back to the pool or close it if no pool.
 
-	Safe to call with None.
-	"""
-	global _DB_POOL
-	if not conn:
-		return
-	try:
-		if _DB_POOL:
-			try:
-				_DB_POOL.putconn(conn)
-				return
-			except Exception:
-				try:
-					conn.close()
-				except Exception:
-					pass
-		else:
-			try:
-				conn.close()
-			except Exception:
-				pass
-	except Exception:
-		try:
-			conn.close()
-		except Exception:
-			pass
+    Safe to call with None.
+    """
+    global _DB_POOL
+    if not conn:
+        return
+    try:
+        if _DB_POOL:
+            try:
+                _DB_POOL.putconn(conn)
+                return
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        else:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def normalize_public_url(pu) -> str:
-	"""Normalize Supabase storage URL results into a usable string.
+    """Normalize Supabase storage URL results into a usable string.
 
-	Accepts either a dict response (older/newer SDKs) or a plain string.
-	Strips whitespace and a trailing lone "?" that some SDK calls return.
-	Returns empty string when the value is missing or clearly invalid.
-	"""
-	if pu is None:
-		return ''
-	# If SDK returns a dict, try common keys for public/signed URLs
-	if isinstance(pu, dict):
-		for key in ('publicURL', 'public_url', 'publicUrl', 'signedURL', 'signed_url', 'signedUrl', 'url'):
-			v = pu.get(key)
-			if v:
-				pu = v
-				break
-		else:
-			# fallback to first value
-			values = [v for v in pu.values() if v]
-			pu = values[0] if values else ''
+    Accepts either a dict response (older/newer SDKs) or a plain string.
+    Strips whitespace and a trailing lone "?" that some SDK calls return.
+    Returns empty string when the value is missing or clearly invalid.
+    """
+    if pu is None:
+        return ''
+    # If SDK returns a dict, try common keys for public/signed URLs
+    if isinstance(pu, dict):
+        for key in ('publicURL', 'public_url', 'publicUrl', 'signedURL', 'signed_url', 'signedUrl', 'url'):
+            v = pu.get(key)
+            if v:
+                pu = v
+                break
+        else:
+            # fallback to first value
+            values = [v for v in pu.values() if v]
+            pu = values[0] if values else ''
 
-	s = '' if pu is None else str(pu).strip()
-	if not s:
-		return ''
+    s = '' if pu is None else str(pu).strip()
+    if not s:
+        return ''
 
-	# Some Supabase responses append a trailing '?' with empty query; remove it.
-	if s.endswith('?'):
-		s = s[:-1].rstrip()
+    # Some Supabase responses append a trailing '?' with empty query; remove it.
+    if s.endswith('?'):
+        s = s[:-1].rstrip()
 
-	# Guard against placeholder strings
-	if s.lower() in ('not_found', 'none', 'null', ''):
-		return ''
+    # Guard against placeholder strings
+    if s.lower() in ('not_found', 'none', 'null', ''):
+        return ''
 
-	return s
+    return s
 
 
 def decode_base64_image(data_url: str) -> Tuple[np.ndarray, bytes]:
-	if ',' not in data_url:
-		raise ValueError('invalid data URL')
-	_, b64 = data_url.split(',', 1)
-	img_bytes = base64.b64decode(b64)
-	img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-	arr = np.array(img)
-	return arr, img_bytes
+    if ',' not in data_url:
+        raise ValueError('invalid data URL')
+    _, b64 = data_url.split(',', 1)
+    img_bytes = base64.b64decode(b64)
+    img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+    arr = np.array(img)
+    return arr, img_bytes
 
 
 def save_debug_image(prefix: str, img_arr) -> None:
-	try:
-		name = f"{prefix}_{uuid.uuid4().hex}.jpg"
-		Image.fromarray(img_arr).save(os.path.join(DEBUG_DIR, name))
-	except Exception:
-		app.logger.exception('failed to persist debug image')
+    try:
+        name = f"{prefix}_{uuid.uuid4().hex}.jpg"
+        Image.fromarray(img_arr).save(os.path.join(DEBUG_DIR, name))
+    except Exception:
+        app.logger.exception('failed to persist debug image')
 
 
 def ensure_storage_ready():
-	if not sb or not SUPABASE_BUCKET:
-		raise RuntimeError('Supabase storage not configured; check SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_BUCKET')
+    if not sb or not SUPABASE_BUCKET:
+        raise RuntimeError('Supabase storage not configured; check SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_BUCKET')
 
 
 def _public_or_signed_url(path: str) -> str:
-	"""Return best-effort public URL; fallback to signed URL if bucket is private."""
-	# First try public URL returned by the SDK
-	try:
-		pu = sb.storage.from_(SUPABASE_BUCKET).get_public_url(path)
-		app.logger.debug('get_public_url raw response: %r', pu)
-		url = normalize_public_url(pu)
-		app.logger.debug('normalized public url: %s', url)
-		if url:
-			# perform a lightweight HEAD check to ensure URL is reachable
-			try:
-				import requests
-				resp = requests.head(url, allow_redirects=True, timeout=5)
-				if resp.status_code in (200, 206):
-					return url
-				app.logger.debug('public url HEAD returned %s, falling back to signed url', resp.status_code)
-			except Exception:
-				# If HEAD fails (CORS/private bucket), still attempt signed URL fallback
-				app.logger.debug('public url HEAD check failed, will try signed URL')
-				pass
-	except Exception:
-		app.logger.debug('get_public_url call failed, will try signed URL')
+    """Return best-effort public URL; fallback to signed URL if bucket is private."""
+    # First try public URL returned by the SDK
+    try:
+        pu = sb.storage.from_(SUPABASE_BUCKET).get_public_url(path)
+        app.logger.debug('get_public_url raw response: %r', pu)
+        url = normalize_public_url(pu)
+        app.logger.debug('normalized public url: %s', url)
+        if url:
+            # perform a lightweight HEAD check to ensure URL is reachable
+            try:
+                import requests
+                resp = requests.head(url, allow_redirects=True, timeout=5)
+                if resp.status_code in (200, 206):
+                    return url
+                app.logger.debug('public url HEAD returned %s, falling back to signed url', resp.status_code)
+            except Exception:
+                # If HEAD fails (CORS/private bucket), still attempt signed URL fallback
+                app.logger.debug('public url HEAD check failed, will try signed URL')
+                pass
+    except Exception:
+        app.logger.debug('get_public_url call failed, will try signed URL')
 
-	# Fallback: create a long-lived signed URL using the service role key
-	try:
-		signed = sb.storage.from_(SUPABASE_BUCKET).create_signed_url(path, 60 * 60 * 24 * 365)  # 1 year
-		app.logger.debug('create_signed_url raw response: %r', signed)
-		url = normalize_public_url(signed)
-		app.logger.debug('normalized signed url: %s', url)
-		if url:
-			return url
-	except Exception:
-		app.logger.exception('create_signed_url failed for path: %s', path)
+    # Fallback: create a long-lived signed URL using the service role key
+    try:
+        signed = sb.storage.from_(SUPABASE_BUCKET).create_signed_url(path, 60 * 60 * 24 * 365)  # 1 year
+        app.logger.debug('create_signed_url raw response: %r', signed)
+        url = normalize_public_url(signed)
+        app.logger.debug('normalized signed url: %s', url)
+        if url:
+            return url
+    except Exception:
+        app.logger.exception('create_signed_url failed for path: %s', path)
 
-	return ''
+    return ''
 
 
 def save_image_to_storage(path: str, img_bytes: bytes) -> str:
-	ensure_storage_ready()
-	try:
-		# storage3 upload expects file bytes; avoid passing boolean values in file options
-		resp = sb.storage.from_(SUPABASE_BUCKET).upload(path, img_bytes)
-		app.logger.info('storage.upload response: %r', resp)
-		url = _public_or_signed_url(path)
-		app.logger.info('save_image_to_storage resolved url: %s for path: %s', url, path)
-		return url
-	except Exception as exc:
-		app.logger.exception('storage upload failed: %s', exc)
-		try:
-			url = _public_or_signed_url(path)
-			if url:
-				return url
-		except Exception:
-			pass
-		import tempfile
+    ensure_storage_ready()
+    try:
+        # storage3 upload expects file bytes; avoid passing boolean values in file options
+        resp = sb.storage.from_(SUPABASE_BUCKET).upload(path, img_bytes)
+        app.logger.info('storage.upload response: %r', resp)
+        url = _public_or_signed_url(path)
+        app.logger.info('save_image_to_storage resolved url: %s for path: %s', url, path)
+        return url
+    except Exception as exc:
+        app.logger.exception('storage upload failed: %s', exc)
+        try:
+            url = _public_or_signed_url(path)
+            if url:
+                return url
+        except Exception:
+            pass
+        import tempfile
 
-		tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-		try:
-			tmp_file.write(img_bytes)
-			tmp_file.flush()
-			tmp_file.close()
-			with open(tmp_file.name, 'rb') as handle:
-				sb.storage.from_(SUPABASE_BUCKET).upload(path, handle.read())
-			return _public_or_signed_url(path)
-		finally:
-			try:
-				os.unlink(tmp_file.name)
-			except Exception:
-				pass
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+        try:
+            tmp_file.write(img_bytes)
+            tmp_file.flush()
+            tmp_file.close()
+            with open(tmp_file.name, 'rb') as handle:
+                sb.storage.from_(SUPABASE_BUCKET).upload(path, handle.read())
+            return _public_or_signed_url(path)
+        finally:
+            try:
+                os.unlink(tmp_file.name)
+            except Exception:
+                pass
 
 
 def download_from_storage(path: str) -> bytes:
-	ensure_storage_ready()
-	try:
-		data = sb.storage.from_(SUPABASE_BUCKET).download(path)
-		if isinstance(data, (bytes, bytearray)):
-			return bytes(data)
-		if isinstance(data, dict) and 'data' in data:
-			return bytes(data['data'])
-	except Exception:
-		pass
-	pu = sb.storage.from_(SUPABASE_BUCKET).get_public_url(path)
-	url = normalize_public_url(pu)
-	if not url:
-		raise RuntimeError('unable to retrieve file from storage')
-	import requests
+    ensure_storage_ready()
+    try:
+        data = sb.storage.from_(SUPABASE_BUCKET).download(path)
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        if isinstance(data, dict) and 'data' in data:
+            return bytes(data['data'])
+    except Exception:
+        pass
+    pu = sb.storage.from_(SUPABASE_BUCKET).get_public_url(path)
+    url = normalize_public_url(pu)
+    if not url:
+        raise RuntimeError('unable to retrieve file from storage')
+    import requests
 
-	resp = requests.get(url, timeout=30)
-	resp.raise_for_status()
-	return resp.content
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    return resp.content
 
 
 def compute_face_encoding(img_arr):
-	"""Compute face encoding. Returns None if face_recognition unavailable or no face detected."""
-	try:
-		import face_recognition
-	except Exception as exc:
-		app.logger.warning('face_recognition not available: %s', str(exc))
-		return None     
-	# Log image details for debugging
-	app.logger.debug('face detection: image shape %s, dtype %s', img_arr.shape, img_arr.dtype)
-	print(f'compute_face_encoding: image shape={getattr(img_arr, "shape", None)}', flush=True)
-	# Fast path: prefer the lightweight `hog` detector with minimal upsampling
-	# and low jitter for encoding. If hog finds no faces, fall back to cnn.
-	
-	locations = []
-	try:
-		locations = face_recognition.face_locations(img_arr, model='hog', number_of_times_to_upsample=0)
-	except Exception:
-		try:
-			locations = face_recognition.face_locations(img_arr)
-		except Exception:
-			locations = []
+    """Compute face encoding. Returns None if face_recognition unavailable or no face detected."""
+    try:
+        import face_recognition
+    except Exception as exc:
+        app.logger.warning('face_recognition not available: %s', str(exc))
+        return None     
+    # Log image details for debugging
+    app.logger.debug('face detection: image shape %s, dtype %s', img_arr.shape, img_arr.dtype)
+    print(f'compute_face_encoding: image shape={getattr(img_arr, "shape", None)}', flush=True)
+    # Fast path: prefer the lightweight `hog` detector with minimal upsampling
+    # and low jitter for encoding. If hog finds no faces, fall back to cnn.
+    
+    locations = []
+    try:
+        locations = face_recognition.face_locations(img_arr, model='hog', number_of_times_to_upsample=0)
+    except Exception:
+        try:
+            locations = face_recognition.face_locations(img_arr)
+        except Exception:
+            locations = []
 
-	app.logger.debug('face detection (fast/hog) found %d locations', len(locations))
+    app.logger.debug('face detection (fast/hog) found %d locations', len(locations))
 
-	# If no faces found with hog, try cnn once with a small upsample for accuracy
-	if not locations:
-		try:
-			locations = face_recognition.face_locations(img_arr, model='cnn', number_of_times_to_upsample=1)
-		except Exception:
-			try:
-				locations = face_recognition.face_locations(img_arr)
-			except Exception:
-				locations = []
+    # If no faces found with hog, try cnn once with a small upsample for accuracy
+    if not locations:
+        try:
+            locations = face_recognition.face_locations(img_arr, model='cnn', number_of_times_to_upsample=1)
+        except Exception:
+            try:
+                locations = face_recognition.face_locations(img_arr)
+            except Exception:
+                locations = []
 
-	app.logger.debug('face detection: final locations count %d', len(locations))
-	if not locations:
-		return None
+    app.logger.debug('face detection: final locations count %d', len(locations))
+    if not locations:
+        return None
 
-	# Compute encodings with minimal jitter to speed up processing.
-	encodings = []
-	try:
-		# Many builds accept `known_face_locations` and `num_jitters`; use low jitter (1)
-		encodings = face_recognition.face_encodings(img_arr, known_face_locations=locations, num_jitters=1)
-	except TypeError:
-		try:
-			encodings = face_recognition.face_encodings(img_arr, locations)
-		except Exception:
-			encodings = []
-	except Exception:
-		encodings = []
+    # Compute encodings with minimal jitter to speed up processing.
+    encodings = []
+    try:
+        # Many builds accept `known_face_locations` and `num_jitters`; use low jitter (1)
+        encodings = face_recognition.face_encodings(img_arr, known_face_locations=locations, num_jitters=1)
+    except TypeError:
+        try:
+            encodings = face_recognition.face_encodings(img_arr, locations)
+        except Exception:
+            encodings = []
+    except Exception:
+        encodings = []
 
-	app.logger.debug('face detection: found %d encodings', len(encodings))
-	if not encodings:
-		return None
-	return encodings[0]
+    app.logger.debug('face detection: found %d encodings', len(encodings))
+    if not encodings:
+        return None
+    return encodings[0]
 
 
 def insert_embedding(cur, user_id: str, encoding, source: str) -> None:
-	# Detect vector availability using a separate connection (cached).
-	has_vector = _detect_vector_type()
+    # Detect vector availability using a separate connection (cached).
+    has_vector = _detect_vector_type()
 
-	# Prefer inserting as PostgreSQL float8[] which works even when pgvector
-	# extension isn't installed. If that fails and `vector` type is available,
-	# fall back to the ::vector cast.
-	list_vals = list(float(x) for x in encoding)
-	sql_array = """
-		INSERT INTO public.embeddings (user_id, embedding, source, created_at)
-		VALUES (%s, %s, %s, now())
-	"""
-	try:
-		app.logger.debug('insert_embedding: attempting float8[] insert, user=%s length=%d', user_id, len(encoding))
-		app.logger.debug('insert_embedding: sql=%s params=%s', sql_array.strip(), '[<list float>]')
-		cur.execute(sql_array, (user_id, list_vals, source))
-		return
-	except Exception:
-		app.logger.exception('insert_embedding: float8[] insert failed, will try vector cast if available')
+    # Prefer inserting as PostgreSQL float8[] which works even when pgvector
+    # extension isn't installed. If that fails and `vector` type is available,
+    # fall back to the ::vector cast.
+    list_vals = list(float(x) for x in encoding)
+    sql_array = """
+        INSERT INTO public.embeddings (user_id, embedding, source, created_at)
+        VALUES (%s, %s, %s, now())
+    """
+    try:
+        app.logger.debug('insert_embedding: attempting float8[] insert, user=%s length=%d', user_id, len(encoding))
+        app.logger.debug('insert_embedding: sql=%s params=%s', sql_array.strip(), '[<list float>]')
+        cur.execute(sql_array, (user_id, list_vals, source))
+        return
+    except Exception:
+        app.logger.exception('insert_embedding: float8[] insert failed, will try vector cast if available')
 
-	if has_vector:
-		try:
-			vec_text = '[' + ','.join(str(float(x)) for x in encoding) + ']'
-			sql_vec = """
-				INSERT INTO public.embeddings (user_id, embedding, source, created_at)
-				VALUES (%s, %s::vector, %s, now())
-			"""
-			app.logger.debug('insert_embedding: attempting ::vector insert, user=%s length=%d', user_id, len(encoding))
-			app.logger.debug('insert_embedding: sql=%s params=%s', sql_vec.strip(), '[vec_text, source]')
-			cur.execute(sql_vec, (user_id, vec_text, source))
-			return
-		except Exception:
-			app.logger.exception('insert_embedding: ::vector insert also failed')
+    if has_vector:
+        try:
+            vec_text = '[' + ','.join(str(float(x)) for x in encoding) + ']'
+            sql_vec = """
+                INSERT INTO public.embeddings (user_id, embedding, source, created_at)
+                VALUES (%s, %s::vector, %s, now())
+            """
+            app.logger.debug('insert_embedding: attempting ::vector insert, user=%s length=%d', user_id, len(encoding))
+            app.logger.debug('insert_embedding: sql=%s params=%s', sql_vec.strip(), '[vec_text, source]')
+            cur.execute(sql_vec, (user_id, vec_text, source))
+            return
+        except Exception:
+            app.logger.exception('insert_embedding: ::vector insert also failed')
 
-	# If we reached here, both insertion attempts failed — raise to caller
-	raise RuntimeError('embedding insert failed for all strategies')
+    # If we reached here, both insertion attempts failed � raise to caller
+    raise RuntimeError('embedding insert failed for all strategies')
 
 
 @app.errorhandler(404)
 def handle_404(err):
-	try:
-		if request.path.startswith('/api/'):
-			return jsonify({'ok': False, 'error': 'not_found', 'path': request.path}), 404
-	except Exception:
-		pass
-	return err
+    try:
+        if request.path.startswith('/api/'):
+            return jsonify({'ok': False, 'error': 'not_found', 'path': request.path}), 404
+    except Exception:
+        pass
+    return err
 
 
 @app.route('/_routes', methods=['GET'])
 def list_routes():
-	rules = sorted(rule.rule for rule in app.url_map.iter_rules())
-	return jsonify({'routes': rules})
+    rules = sorted(rule.rule for rule in app.url_map.iter_rules())
+    return jsonify({'routes': rules})
 
 
 @app.route('/', methods=['GET'])
 def index():
-	template = app.template_folder or ''
-	index_path = os.path.join(template, 'index.html')
-	if template and os.path.exists(index_path):
-		return render_template('index.html')
-	return 'OK'
+    template = app.template_folder or ''
+    index_path = os.path.join(template, 'index.html')
+    if template and os.path.exists(index_path):
+        return render_template('index.html')
+    return 'OK'
 
 
 @app.route('/signup', methods=['GET'])
 def signup():
-	tmpl = app.template_folder or ''
-	page = os.path.join(tmpl, 'welcome.html')
-	if tmpl and os.path.exists(page):
-		return render_template('welcome.html')
-	return render_template('index.html') if os.path.exists(os.path.join(tmpl, 'index.html')) else 'Signup'
+    tmpl = app.template_folder or ''
+    page = os.path.join(tmpl, 'welcome.html')
+    if tmpl and os.path.exists(page):
+        return render_template('welcome.html')
+    return render_template('index.html') if os.path.exists(os.path.join(tmpl, 'index.html')) else 'Signup'
 
 
 
 
 @app.route('/health', methods=['GET'])
 def health_check():
-	"""Health endpoint for load balancers and deployment checks.
+    """Health endpoint for load balancers and deployment checks.
 
-	Returns JSON with:
-	  - app: basic app liveness
-	  - face_model: whether `face_recognition` is importable and can run a trivial encoding
-	  - db: whether a simple DB query succeeds
-	"""
-	result = {'ok': True, 'app': 'ok', 'face_model': {'available': False}, 'db': {'connected': False}}
+    Returns JSON with:
+      - app: basic app liveness
+      - face_model: whether `face_recognition` is importable and can run a trivial encoding
+      - db: whether a simple DB query succeeds
+    """
+    result = {'ok': True, 'app': 'ok', 'face_model': {'available': False}, 'db': {'connected': False}}
 
-	# Check face_recognition availability
-	try:
-		import numpy as _np
-		try:
-			import face_recognition as _fr
-			# run a tiny no-face encoding to ensure libs load (fast)
-			blank = _np.zeros((10, 10, 3), dtype=_np.uint8)
-			encs = _fr.face_encodings(blank)
-			result['face_model'] = {'available': True, 'encodings': len(encs)}
-		except Exception as exc:
-			result['face_model'] = {'available': False, 'detail': str(exc)}
-	except Exception as exc:
-		result['face_model'] = {'available': False, 'detail': 'numpy import failed: ' + str(exc)}
+    # Check face_recognition availability
+    try:
+        import numpy as _np
+        try:
+            import face_recognition as _fr
+            # run a tiny no-face encoding to ensure libs load (fast)
+            blank = _np.zeros((10, 10, 3), dtype=_np.uint8)
+            encs = _fr.face_encodings(blank)
+            result['face_model'] = {'available': True, 'encodings': len(encs)}
+        except Exception as exc:
+            result['face_model'] = {'available': False, 'detail': str(exc)}
+    except Exception as exc:
+        result['face_model'] = {'available': False, 'detail': 'numpy import failed: ' + str(exc)}
 
-	# Check DB connectivity
-	try:
-		conn = get_db_conn()
-		cur = conn.cursor()
-		cur.execute('SELECT 1')
-		_ = cur.fetchone()
-		cur.close()
-		try:
-			conn.close()
-		except Exception:
-			pass
-		result['db'] = {'connected': True}
-	except Exception as exc:
-		result['db'] = {'connected': False, 'detail': str(exc)}
+    # Check DB connectivity
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute('SELECT 1')
+        _ = cur.fetchone()
+        cur.close()
+        try:
+            release_db_conn(conn)
+        except Exception:
+            try:
+                release_db_conn(conn)
+            except Exception:
+                pass
+        result['db'] = {'connected': True}
+    except Exception as exc:
+        result['db'] = {'connected': False, 'detail': str(exc)}
 
-	status_code = 200 if result['db'].get('connected') and result['face_model'].get('available') else 200
-	return jsonify(result), status_code
+    status_code = 200 if result['db'].get('connected') and result['face_model'].get('available') else 200
+    return jsonify(result), status_code
 
 
 @app.route('/api/detect_face', methods=['POST'])
 def api_detect_face():
-	payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
-	data_url = payload.get('face_image') or payload.get('image')
-	if not data_url:
-		return jsonify({'ok': False, 'error': 'missing_image'}), 400
-	# Accept either a data URL (base64), an HTTP(S) URL (public Supabase URL),
-	# or a Supabase storage path (download via download_from_storage).
-	img_arr = None
-	try:
-		# HTTP(S) URL: fetch bytes via requests
-		if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
-			import requests
-			resp = requests.get(data_url, timeout=20)
-			resp.raise_for_status()
-			img_bytes = resp.content
-			from PIL import Image as PILImage
-			img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
-			img_arr = np.array(img)
-		# Data URL (base64): decode locally
-		elif isinstance(data_url, str) and data_url.startswith('data:'):
-			img_arr, _ = decode_base64_image(data_url)
-		else:
-			# Treat input as a storage path: prefer resolving a public URL and fetching
-			# that URL so frontends can simply pass the public link. If that fails,
-			# fall back to direct download_from_storage or base64 decode.
-			fetched = False
-			if sb and SUPABASE_BUCKET:
-				try:
-					pub = _public_or_signed_url(data_url)
-					if pub:
-						import requests
-						r = requests.get(pub, timeout=20)
-						r.raise_for_status()
-						img_bytes = r.content
-						from PIL import Image as PILImage
-						img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
-						img_arr = np.array(img)
-						fetched = True
-				except Exception:
-					fetched = False
-			if not fetched:
-				try:
-					raw = download_from_storage(data_url)
-					img_bytes = raw
-					from PIL import Image as PILImage
-					img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
-					img_arr = np.array(img)
-				except Exception:
-					img_arr, _ = decode_base64_image(data_url)
-	except Exception as exc:
-		return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
+    payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+    data_url = payload.get('face_image') or payload.get('image')
+    if not data_url:
+        return jsonify({'ok': False, 'error': 'missing_image'}), 400
+    # Accept either a data URL (base64), an HTTP(S) URL (public Supabase URL),
+    # or a Supabase storage path (download via download_from_storage).
+    img_arr = None
+    try:
+        # HTTP(S) URL: fetch bytes via requests
+        if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
+            import requests
+            resp = requests.get(data_url, timeout=20)
+            resp.raise_for_status()
+            img_bytes = resp.content
+            from PIL import Image as PILImage
+            img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
+            img_arr = np.array(img)
+        # Data URL (base64): decode locally
+        elif isinstance(data_url, str) and data_url.startswith('data:'):
+            img_arr, _ = decode_base64_image(data_url)
+        else:
+            # Treat input as a storage path: prefer resolving a public URL and fetching
+            # that URL so frontends can simply pass the public link. If that fails,
+            # fall back to direct download_from_storage or base64 decode.
+            fetched = False
+            if sb and SUPABASE_BUCKET:
+                try:
+                    pub = _public_or_signed_url(data_url)
+                    if pub:
+                        import requests
+                        r = requests.get(pub, timeout=20)
+                        r.raise_for_status()
+                        img_bytes = r.content
+                        from PIL import Image as PILImage
+                        img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
+                        img_arr = np.array(img)
+                        fetched = True
+                except Exception:
+                    fetched = False
+            if not fetched:
+                try:
+                    raw = download_from_storage(data_url)
+                    img_bytes = raw
+                    from PIL import Image as PILImage
+                    img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
+                    img_arr = np.array(img)
+                except Exception:
+                    img_arr, _ = decode_base64_image(data_url)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
 
-	try:
-		import face_recognition
-	except Exception as exc:
-		return jsonify({
-			'ok': False,
-			'error': 'face_recognition_unavailable',
-			'detail': 'face_recognition library not installed. Image upload still works but face detection disabled.'
-		}), 501
+    try:
+        import face_recognition
+    except Exception as exc:
+        return jsonify({
+            'ok': False,
+            'error': 'face_recognition_unavailable',
+            'detail': 'face_recognition library not installed. Image upload still works but face detection disabled.'
+        }), 501
 
-	locations = face_recognition.face_locations(img_arr, model='large', number_of_times_to_upsample=2)
-	faces = [{'top': t, 'right': r, 'bottom': b, 'left': l} for t, r, b, l in locations]
+    locations = face_recognition.face_locations(img_arr, model='large', number_of_times_to_upsample=2)
+    faces = [{'top': t, 'right': r, 'bottom': b, 'left': l} for t, r, b, l in locations]
 
-	# Read-only detect: return bounding boxes only (no DB writes).
-	return jsonify({'ok': True, 'faces': faces}), 200
+    # Read-only detect: return bounding boxes only (no DB writes).
+    return jsonify({'ok': True, 'faces': faces}), 200
 
 
 @app.route('/api/upload_face_temp', methods=['POST'])
 def api_upload_face_temp():
-	"""Upload a face image to temp/ and return storage_path + usable URL (public or signed).
-	Use this if your frontend still expects a temp upload step before capture/register.
-	"""
-	payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
-	data_url = payload.get('face_image') or payload.get('image')
-	if not data_url:
-		return jsonify({'ok': False, 'error': 'missing_image'}), 400
-	try:
-		img_arr, img_bytes = decode_base64_image(data_url)
-	except Exception as exc:
-		return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
+    """Upload a face image to temp/ and return storage_path + usable URL (public or signed).
+    Use this if your frontend still expects a temp upload step before capture/register.
+    """
+    payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+    data_url = payload.get('face_image') or payload.get('image')
+    if not data_url:
+        return jsonify({'ok': False, 'error': 'missing_image'}), 400
+    try:
+        img_arr, img_bytes = decode_base64_image(data_url)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
 
-	save_debug_image('upload_temp', img_arr)
+    save_debug_image('upload_temp', img_arr)
 
-	try:
-		ensure_storage_ready()
-	except Exception as exc:
-		return jsonify({'ok': False, 'error': 'storage_not_configured', 'detail': str(exc)}), 500
+    try:
+        ensure_storage_ready()
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': 'storage_not_configured', 'detail': str(exc)}), 500
 
-	storage_path = f"temp/{uuid.uuid4().hex}.jpg"
-	try:
-		url = save_image_to_storage(storage_path, img_bytes)
-		if not url:
-			app.logger.warning('upload returned empty url for %s', storage_path)
-			url = storage_path
-	except Exception as exc:
-		app.logger.exception('upload_face_temp failed: %s', exc)
-		return jsonify({'ok': False, 'error': 'upload_failed', 'detail': str(exc)}), 500
+    storage_path = f"temp/{uuid.uuid4().hex}.jpg"
+    try:
+        url = save_image_to_storage(storage_path, img_bytes)
+        if not url:
+            app.logger.warning('upload returned empty url for %s', storage_path)
+            url = storage_path
+    except Exception as exc:
+        app.logger.exception('upload_face_temp failed: %s', exc)
+        return jsonify({'ok': False, 'error': 'upload_failed', 'detail': str(exc)}), 500
 
-	# Always return a preview data URL so frontend can show image immediately
-	try:
-		preview_data_url = 'data:image/jpeg;base64,' + base64.b64encode(img_bytes).decode()
-	except Exception:
-		preview_data_url = None
+    # Always return a preview data URL so frontend can show image immediately
+    try:
+        preview_data_url = 'data:image/jpeg;base64,' + base64.b64encode(img_bytes).decode()
+    except Exception:
+        preview_data_url = None
 
-	app.logger.info('upload_face_temp succeeded: path=%s url=%s', storage_path, url)
-	return jsonify({'ok': True, 'temp_storage_path': storage_path, 'public_url': url, 'preview_data_url': preview_data_url}), 200
+    app.logger.info('upload_face_temp succeeded: path=%s url=%s', storage_path, url)
+    return jsonify({'ok': True, 'temp_storage_path': storage_path, 'public_url': url, 'preview_data_url': preview_data_url}), 200
 
 
 # Legacy alias so existing frontend calls to /api/upload_face keep working
 @app.route('/api/upload_face', methods=['POST'])
 def api_upload_face_legacy():
-	return api_upload_face_temp()
+    return api_upload_face_temp()
 
 
 @app.route('/api/capture_face', methods=['POST'])
 def api_capture_face():
-	payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
-	user_id = payload.get('user_id')
-	data_url = payload.get('face_image') or payload.get('image')
-	# allow capture-first flow: if no user_id provided, create a provisional user record
-	if not data_url:
-		return jsonify({'ok': False, 'error': 'missing_image'}), 400
+    payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+    user_id = payload.get('user_id')
+    data_url = payload.get('face_image') or payload.get('image')
+    # allow capture-first flow: if no user_id provided, create a provisional user record
+    if not data_url:
+        return jsonify({'ok': False, 'error': 'missing_image'}), 400
 
-	# Accept data URL, HTTP(S) URL, or storage path. Prefer public URL for storage paths.
-	try:
-		if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
-			import requests
-			resp = requests.get(data_url, timeout=20)
-			resp.raise_for_status()
-			img_bytes = resp.content
-			img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-			img_arr = np.array(img)
-		elif isinstance(data_url, str) and data_url.startswith('data:'):
-			img_arr, img_bytes = decode_base64_image(data_url)
-		else:
-			fetched = False
-			if sb and SUPABASE_BUCKET:
-				try:
-					pub = _public_or_signed_url(data_url)
-					if pub:
-						import requests
-						r = requests.get(pub, timeout=20)
-						r.raise_for_status()
-						img_bytes = r.content
-						img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-						img_arr = np.array(img)
-						fetched = True
-				except Exception:
-					fetched = False
-			if not fetched:
-				try:
-					raw = download_from_storage(data_url)
-					img_bytes = raw
-					img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-					img_arr = np.array(img)
-				except Exception:
-					img_arr, img_bytes = decode_base64_image(data_url)
-	except Exception as exc:
-		return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
+    # Accept data URL, HTTP(S) URL, or storage path. Prefer public URL for storage paths.
+    try:
+        if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
+            import requests
+            resp = requests.get(data_url, timeout=20)
+            resp.raise_for_status()
+            img_bytes = resp.content
+            img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+            img_arr = np.array(img)
+        elif isinstance(data_url, str) and data_url.startswith('data:'):
+            img_arr, img_bytes = decode_base64_image(data_url)
+        else:
+            fetched = False
+            if sb and SUPABASE_BUCKET:
+                try:
+                    pub = _public_or_signed_url(data_url)
+                    if pub:
+                        import requests
+                        r = requests.get(pub, timeout=20)
+                        r.raise_for_status()
+                        img_bytes = r.content
+                        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                        img_arr = np.array(img)
+                        fetched = True
+                except Exception:
+                    fetched = False
+            if not fetched:
+                try:
+                    raw = download_from_storage(data_url)
+                    img_bytes = raw
+                    img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                    img_arr = np.array(img)
+                except Exception:
+                    img_arr, img_bytes = decode_base64_image(data_url)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
 
-	save_debug_image('capture', img_arr)
+    save_debug_image('capture', img_arr)
 
-	# Try to compute encoding, but allow capture even if face_recognition unavailable
-	encoding = compute_face_encoding(img_arr)
-	if encoding is None:
-		app.logger.warning('capture_face: no encoding computed (face_recognition unavailable or no face detected)')
+    # Try to compute encoding, but allow capture even if face_recognition unavailable
+    encoding = compute_face_encoding(img_arr)
+    if encoding is None:
+        app.logger.warning('capture_face: no encoding computed (face_recognition unavailable or no face detected)')
 
-	try:
-		ensure_storage_ready()
-	except Exception as exc:
-		return jsonify({'ok': False, 'error': 'storage_not_configured', 'detail': str(exc)}), 500
+    try:
+        ensure_storage_ready()
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': 'storage_not_configured', 'detail': str(exc)}), 500
 
-	# If user_id missing, create provisional user to attach face/embedding to
-	provisional_created = False
-	if not user_id:
-		conn = get_db_conn()
-		cur = conn.cursor()
-		try:
-			temp_username = f"temp_{uuid.uuid4().hex[:8]}"
-			cur.execute(
-				"""
-					INSERT INTO public.users (display_name, username, email, phone, created_at, verified)
-					VALUES (%s, %s, %s, %s, now(), false)
-					RETURNING id
-				""",
-				(temp_username, temp_username, None, None),
-			)
-			user_id = cur.fetchone()[0]
-			conn.commit()
-			provisional_created = True
-		except Exception as exc:
-			conn.rollback()
-			app.logger.exception('provisional user create failed')
-			cur.close()
-			conn.close()
-			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-		finally:
-			cur.close()
-			conn.close()
+    # If user_id missing, create provisional user to attach face/embedding to
+    provisional_created = False
+    if not user_id:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            temp_username = f"temp_{uuid.uuid4().hex[:8]}"
+            cur.execute(
+                """
+                    INSERT INTO public.users (display_name, username, email, phone, created_at, verified)
+                    VALUES (%s, %s, %s, %s, now(), false)
+                    RETURNING id
+                """,
+                (temp_username, temp_username, None, None),
+            )
+            user_id = cur.fetchone()[0]
+            conn.commit()
+            provisional_created = True
+        except Exception as exc:
+            conn.rollback()
+            app.logger.exception('provisional user create failed')
+            cur.close()
+            try:
+                release_db_conn(conn)
+            except Exception:
+                try:
+                    release_db_conn(conn)
+                except Exception:
+                    pass
+            return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+        finally:
+            cur.close()
+            try:
+                release_db_conn(conn)
+            except Exception:
+                try:
+                    release_db_conn(conn)
+                except Exception:
+                    pass
 
-	conn = get_db_conn()
-	cur = conn.cursor()
-	try:
-		filename = f"{int(time.time())}_{uuid.uuid4().hex}.jpg"
-		storage_path = f"{user_id}/{filename}"
-		public_url = save_image_to_storage(storage_path, img_bytes)
-		if not public_url:
-			public_url = storage_path  # return path so client can still reference
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        filename = f"{int(time.time())}_{uuid.uuid4().hex}.jpg"
+        storage_path = f"{user_id}/{filename}"
+        public_url = save_image_to_storage(storage_path, img_bytes)
+        if not public_url:
+            public_url = storage_path  # return path so client can still reference
 
-		cur.execute(
-			"""
-				INSERT INTO public.user_images (user_id, storage_path, public_url, width, height, mime_type, uploaded_at, is_profile, file_size)
-				VALUES (%s, %s, %s, %s, %s, %s, now(), %s, %s)
-			""",
-			(
-				user_id,
-				storage_path,
-				public_url,
-				img_arr.shape[1],
-				img_arr.shape[0],
-				'image/jpeg',
-				True,
-				len(img_bytes),
-			),
-		)
+        cur.execute(
+            """
+                INSERT INTO public.user_images (user_id, storage_path, public_url, width, height, mime_type, uploaded_at, is_profile, file_size)
+                VALUES (%s, %s, %s, %s, %s, %s, now(), %s, %s)
+            """,
+            (
+                user_id,
+                storage_path,
+                public_url,
+                img_arr.shape[1],
+                img_arr.shape[0],
+                'image/jpeg',
+                True,
+                len(img_bytes),
+            ),
+        )
 
-		# Insert embedding only if we have one
-		if encoding is not None:
-			try:
-				insert_embedding(cur, user_id, encoding, 'capture')
-			except Exception:
-				app.logger.exception('capture_face: embedding insert failed, continuing')
-		conn.commit()
-	except Exception as exc:
-		conn.rollback()
-		app.logger.exception('capture_face: db error')
-		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-	finally:
-		cur.close()
-		conn.close()
+        # Insert embedding only if we have one
+        if encoding is not None:
+            try:
+                insert_embedding(cur, user_id, encoding, 'capture')
+            except Exception:
+                app.logger.exception('capture_face: embedding insert failed, continuing')
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        app.logger.exception('capture_face: db error')
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+    finally:
+        cur.close()
+        try:
+            release_db_conn(conn)
+        except Exception:
+            try:
+                release_db_conn(conn)
+            except Exception:
+                pass
 
-	try:
-		preview_data_url = 'data:image/jpeg;base64,' + base64.b64encode(img_bytes).decode()
-	except Exception:
-		preview_data_url = None
-	app.logger.info('capture_face succeeded: user=%s path=%s url=%s', user_id, storage_path, public_url)
-	return jsonify({'ok': True, 'profile_image_url': public_url, 'storage_path': storage_path, 'preview_data_url': preview_data_url}), 201
+    try:
+        preview_data_url = 'data:image/jpeg;base64,' + base64.b64encode(img_bytes).decode()
+    except Exception:
+        preview_data_url = None
+    app.logger.info('capture_face succeeded: user=%s path=%s url=%s', user_id, storage_path, public_url)
+    return jsonify({'ok': True, 'profile_image_url': public_url, 'storage_path': storage_path, 'preview_data_url': preview_data_url}), 201
 
 
 
 
 @app.route('/api/register', methods=['POST'])
 def api_register():
-	payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
-	display_name = payload.get('display_name') or payload.get('name')
-	username = payload.get('username')
-	email = payload.get('email')
-	phone = payload.get('phone')
-	consent = coerce_bool(payload.get('consent_terms'))
+    payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+    display_name = payload.get('display_name') or payload.get('name')
+    username = payload.get('username')
+    email = payload.get('email')
+    phone = payload.get('phone')
+    consent = coerce_bool(payload.get('consent_terms'))
 
-	if not display_name or not username or not consent:
-		return jsonify({'ok': False, 'error': 'missing_fields'}), 400
+    if not display_name or not username or not consent:
+        return jsonify({'ok': False, 'error': 'missing_fields'}), 400
 
-	# parse optional profile fields
-	date_of_birth = payload.get('date_of_birth') or None
-	# emergency_contact may be JSON string or form-encoded string
-	emergency_contact_raw = payload.get('emergency_contact')
-	emergency_contact = None
-	if emergency_contact_raw:
-		try:
-			if isinstance(emergency_contact_raw, str):
-				emergency_contact = json.loads(emergency_contact_raw)
-			else:
-				emergency_contact = emergency_contact_raw
-		except Exception:
-			emergency_contact = {'raw': emergency_contact_raw}
+    # parse optional profile fields
+    date_of_birth = payload.get('date_of_birth') or None
+    # emergency_contact may be JSON string or form-encoded string
+    emergency_contact_raw = payload.get('emergency_contact')
+    emergency_contact = None
+    if emergency_contact_raw:
+        try:
+            if isinstance(emergency_contact_raw, str):
+                emergency_contact = json.loads(emergency_contact_raw)
+            else:
+                emergency_contact = emergency_contact_raw
+        except Exception:
+            emergency_contact = {'raw': emergency_contact_raw}
 
-	# medications: accept JSON array or comma-separated list
-	medications_field = payload.get('medications')
-	medications = None
-	if medications_field:
-		try:
-			if isinstance(medications_field, str) and medications_field.strip().startswith('['):
-				medications = json.loads(medications_field)
-			elif isinstance(medications_field, str):
-				medications = [m.strip() for m in medications_field.split(',') if m.strip()]
-			else:
-				medications = medications_field
-		except Exception:
-			medications = [medications_field]
+    # medications: accept JSON array or comma-separated list
+    medications_field = payload.get('medications')
+    medications = None
+    if medications_field:
+        try:
+            if isinstance(medications_field, str) and medications_field.strip().startswith('['):
+                medications = json.loads(medications_field)
+            elif isinstance(medications_field, str):
+                medications = [m.strip() for m in medications_field.split(',') if m.strip()]
+            else:
+                medications = medications_field
+        except Exception:
+            medications = [medications_field]
 
-	# allergies: accept comma-separated values and convert to text[]
-	allergies_field = payload.get('allergies')
-	allergies = None
-	if allergies_field:
-		if isinstance(allergies_field, str):
-			allergies = [a.strip() for a in allergies_field.split(',') if a.strip()]
-		else:
-			allergies = allergies_field
+    # allergies: accept comma-separated values and convert to text[]
+    allergies_field = payload.get('allergies')
+    allergies = None
+    if allergies_field:
+        if isinstance(allergies_field, str):
+            allergies = [a.strip() for a in allergies_field.split(',') if a.strip()]
+        else:
+            allergies = allergies_field
 
-	accessibility_needs = payload.get('accessibility_needs')
-	preferred_language = payload.get('preferred_language')
+    accessibility_needs = payload.get('accessibility_needs')
+    preferred_language = payload.get('preferred_language')
 
-	conn = get_db_conn()
-	cur = conn.cursor()
-	try:
-		# Use psycopg2 Json wrapper for jsonb columns
-		try:
-			from psycopg2.extras import Json
-		except Exception:
-			Json = lambda x: json.dumps(x) if x is not None else None
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        # Use psycopg2 Json wrapper for jsonb columns
+        try:
+            from psycopg2.extras import Json
+        except Exception:
+            Json = lambda x: json.dumps(x) if x is not None else None
 
-		cur.execute(
-			"""
-				INSERT INTO public.users (
-					display_name, username, email, phone, date_of_birth,
-					emergency_contact, medications, allergies, accessibility_needs, preferred_language, created_at
-				)
-				VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
-				ON CONFLICT (username) DO UPDATE SET
-					display_name = EXCLUDED.display_name,
-					email = EXCLUDED.email,
-					phone = EXCLUDED.phone,
-					date_of_birth = EXCLUDED.date_of_birth,
-					emergency_contact = EXCLUDED.emergency_contact,
-					medications = EXCLUDED.medications,
-					allergies = EXCLUDED.allergies,
-					accessibility_needs = EXCLUDED.accessibility_needs,
-					preferred_language = EXCLUDED.preferred_language
-				RETURNING id
-			""",
-			(
-				display_name,
-				username,
-				email,
-				phone,
-				date_of_birth,
-				Json(emergency_contact) if emergency_contact is not None else None,
-				Json(medications) if medications is not None else None,
-				allergies,
-				accessibility_needs,
-				preferred_language,
-			),
-		)
-		user_id = cur.fetchone()[0]
-		conn.commit()
-	except Exception as exc:
-		conn.rollback()
-		app.logger.exception('register: db error')
-		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-	finally:
-		cur.close()
-		conn.close()
+        cur.execute(
+            """
+                INSERT INTO public.users (
+                    display_name, username, email, phone, date_of_birth,
+                    emergency_contact, medications, allergies, accessibility_needs, preferred_language, created_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (username) DO UPDATE SET
+                    display_name = EXCLUDED.display_name,
+                    email = EXCLUDED.email,
+                    phone = EXCLUDED.phone,
+                    date_of_birth = EXCLUDED.date_of_birth,
+                    emergency_contact = EXCLUDED.emergency_contact,
+                    medications = EXCLUDED.medications,
+                    allergies = EXCLUDED.allergies,
+                    accessibility_needs = EXCLUDED.accessibility_needs,
+                    preferred_language = EXCLUDED.preferred_language
+                RETURNING id
+            """,
+            (
+                display_name,
+                username,
+                email,
+                phone,
+                date_of_birth,
+                Json(emergency_contact) if emergency_contact is not None else None,
+                Json(medications) if medications is not None else None,
+                allergies,
+                accessibility_needs,
+                preferred_language,
+            ),
+        )
+        user_id = cur.fetchone()[0]
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        app.logger.exception('register: db error')
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+    finally:
+        cur.close()
+        try:
+            release_db_conn(conn)
+        except Exception:
+            try:
+                release_db_conn(conn)
+            except Exception:
+                pass
 
-	# If the client provided an image data URL or temp path, attach it to the user and insert embedding
-	image_data_url = payload.get('image') or payload.get('face_image') or payload.get('image_url')
-	temp_path = payload.get('temp_storage_path') or payload.get('temp_path')
-	if image_data_url or temp_path:
-		try:
-			if image_data_url:
-				# Accept data URL, HTTP(S) URL, or storage path
-				if isinstance(image_data_url, str) and (image_data_url.startswith('http://') or image_data_url.startswith('https://')):
-					import requests
-					resp = requests.get(image_data_url, timeout=20)
-					resp.raise_for_status()
-					img_bytes = resp.content
-					img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-					img_arr = np.array(img)
-				elif isinstance(image_data_url, str) and image_data_url.startswith('data:'):
-					img_arr, img_bytes = decode_base64_image(image_data_url)
-				else:
-					# treat as storage path
-					try:
-						raw = download_from_storage(image_data_url)
-						img_bytes = raw
-						img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-						img_arr = np.array(img)
-					except Exception:
-						img_arr, img_bytes = decode_base64_image(image_data_url)
-			else:
-				# download the temp file from storage and reuse its storage path (do NOT re-upload)
-				raw = download_from_storage(temp_path)
-				img_bytes = raw
-				from PIL import Image as PILImage
-				import numpy as np
-				img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
-				img_arr = np.array(img)
+    # If the client provided an image data URL or temp path, attach it to the user and insert embedding
+    image_data_url = payload.get('image') or payload.get('face_image') or payload.get('image_url')
+    temp_path = payload.get('temp_storage_path') or payload.get('temp_path')
+    if image_data_url or temp_path:
+        try:
+            if image_data_url:
+                # Accept data URL, HTTP(S) URL, or storage path
+                if isinstance(image_data_url, str) and (image_data_url.startswith('http://') or image_data_url.startswith('https://')):
+                    import requests
+                    resp = requests.get(image_data_url, timeout=20)
+                    resp.raise_for_status()
+                    img_bytes = resp.content
+                    img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                    img_arr = np.array(img)
+                elif isinstance(image_data_url, str) and image_data_url.startswith('data:'):
+                    img_arr, img_bytes = decode_base64_image(image_data_url)
+                else:
+                    # treat as storage path
+                    try:
+                        raw = download_from_storage(image_data_url)
+                        img_bytes = raw
+                        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                        img_arr = np.array(img)
+                    except Exception:
+                        img_arr, img_bytes = decode_base64_image(image_data_url)
+            else:
+                # download the temp file from storage and reuse its storage path (do NOT re-upload)
+                raw = download_from_storage(temp_path)
+                img_bytes = raw
+                from PIL import Image as PILImage
+                import numpy as np
+                img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
+                img_arr = np.array(img)
 
-			save_debug_image('register', img_arr)
-			conn = get_db_conn()
-			cur = conn.cursor()
-			try:
-				# If the frontend provided a temp storage path, keep that path (e.g. "Registration/...")
-				# rather than re-uploading into a new user-specific folder. We still download
-				# the object to compute dimensions and embeddings.
-				if temp_path:
-					# normalize path and avoid leading slashes
-					storage_path = temp_path.lstrip('/')
-					public_url = _public_or_signed_url(storage_path) or storage_path
-				else:
-					# fallback: create user folder and upload
-					filename = f"{int(time.time())}_{uuid.uuid4().hex}.jpg"
-					storage_path = f"{user_id}/{filename}"
-					public_url = save_image_to_storage(storage_path, img_bytes) or storage_path
-				cur.execute(
-					"""
-						INSERT INTO public.user_images (user_id, storage_path, public_url, width, height, mime_type, uploaded_at, is_profile, file_size)
-						VALUES (%s, %s, %s, %s, %s, %s, now(), %s, %s)
-					""",
-					(
-						user_id,
-						storage_path,
-						public_url,
-						img_arr.shape[1],
-						img_arr.shape[0],
-						'image/jpeg',
-						True,
-						len(img_bytes),
-					),
-				)
-				# Try to compute encoding and insert embedding separately
-				# This is optional - registration succeeds even without face encoding
-				encoding = compute_face_encoding(img_arr)
-				if encoding is not None:
-					try:
-						insert_embedding(cur, user_id, encoding, 'register')
-						app.logger.info('register: embedding inserted successfully')
-					except Exception:
-						app.logger.warning('register: failed to insert embedding, continuing')
-				else:
-					app.logger.warning('register: no encoding computed (face_recognition unavailable or no face)')
-				conn.commit()
-			except Exception as exc:
-				conn.rollback()
-				app.logger.exception('register: failed to attach image')
-			finally:
-				cur.close()
-				conn.close()
-		except Exception:
-			app.logger.exception('register: image handling failed')
+            save_debug_image('register', img_arr)
+            conn = get_db_conn()
+            cur = conn.cursor()
+            try:
+                # If the frontend provided a temp storage path, keep that path (e.g. "Registration/...")
+                # rather than re-uploading into a new user-specific folder. We still download
+                # the object to compute dimensions and embeddings.
+                if temp_path:
+                    # normalize path and avoid leading slashes
+                    storage_path = temp_path.lstrip('/')
+                    public_url = _public_or_signed_url(storage_path) or storage_path
+                else:
+                    # fallback: create user folder and upload
+                    filename = f"{int(time.time())}_{uuid.uuid4().hex}.jpg"
+                    storage_path = f"{user_id}/{filename}"
+                    public_url = save_image_to_storage(storage_path, img_bytes) or storage_path
+                cur.execute(
+                    """
+                        INSERT INTO public.user_images (user_id, storage_path, public_url, width, height, mime_type, uploaded_at, is_profile, file_size)
+                        VALUES (%s, %s, %s, %s, %s, %s, now(), %s, %s)
+                    """,
+                    (
+                        user_id,
+                        storage_path,
+                        public_url,
+                        img_arr.shape[1],
+                        img_arr.shape[0],
+                        'image/jpeg',
+                        True,
+                        len(img_bytes),
+                    ),
+                )
+                # Try to compute encoding and insert embedding separately
+                # This is optional - registration succeeds even without face encoding
+                encoding = compute_face_encoding(img_arr)
+                if encoding is not None:
+                    try:
+                        insert_embedding(cur, user_id, encoding, 'register')
+                        app.logger.info('register: embedding inserted successfully')
+                    except Exception:
+                        app.logger.warning('register: failed to insert embedding, continuing')
+                else:
+                    app.logger.warning('register: no encoding computed (face_recognition unavailable or no face)')
+                conn.commit()
+            except Exception as exc:
+                conn.rollback()
+                app.logger.exception('register: failed to attach image')
+            finally:
+                cur.close()
+                try:
+                    release_db_conn(conn)
+                except Exception:
+                    try:
+                        release_db_conn(conn)
+                    except Exception:
+                        pass
+        except Exception:
+            app.logger.exception('register: image handling failed')
 
-	return jsonify({'ok': True, 'user_id': str(user_id), 'display_name': display_name}), 201
+    return jsonify({'ok': True, 'user_id': str(user_id), 'display_name': display_name}), 201
 
 
 # Legacy POST /signup route used by the web client (form POST)
 @app.route('/signup', methods=['POST'])
 def signup_post():
-	# reuse api_register which reads from the same request context
-	return api_register()
+    # reuse api_register which reads from the same request context
+    return api_register()
 
 
 @app.route('/api/attach_image', methods=['POST'])
 def api_attach_image():
-	"""Attach an image to an existing user. Accepts `user_id` and `face_image` (data URL)
-	or `temp_storage_path`. This runs in its own transactions and won't rollback user creation.
-	"""
-	payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
-	user_id = payload.get('user_id')
-	if not user_id:
-		return jsonify({'ok': False, 'error': 'missing_user_id'}), 400
+    """Attach an image to an existing user. Accepts `user_id` and `face_image` (data URL)
+    or `temp_storage_path`. This runs in its own transactions and won't rollback user creation.
+    """
+    payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+    user_id = payload.get('user_id')
+    if not user_id:
+        return jsonify({'ok': False, 'error': 'missing_user_id'}), 400
 
-	data_url = payload.get('face_image') or payload.get('image')
-	temp_path = payload.get('temp_storage_path') or payload.get('temp_path')
-	if not data_url and not temp_path:
-		return jsonify({'ok': False, 'error': 'missing_image'}), 400
+    data_url = payload.get('face_image') or payload.get('image')
+    temp_path = payload.get('temp_storage_path') or payload.get('temp_path')
+    if not data_url and not temp_path:
+        return jsonify({'ok': False, 'error': 'missing_image'}), 400
 
-	try:
-		if data_url:
-			# Accept HTTP(S) URL, data URL, or treat as storage path. Prefer public URL.
-			if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
-				import requests
-				r = requests.get(data_url, timeout=20)
-				r.raise_for_status()
-				img_bytes = r.content
-				img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-				img_arr = np.array(img)
-			elif isinstance(data_url, str) and data_url.startswith('data:'):
-				img_arr, img_bytes = decode_base64_image(data_url)
-			else:
-				fetched = False
-				if sb and SUPABASE_BUCKET:
-					try:
-						pub = _public_or_signed_url(data_url)
-						if pub:
-							import requests
-							r = requests.get(pub, timeout=20)
-							r.raise_for_status()
-							img_bytes = r.content
-							img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-							img_arr = np.array(img)
-							fetched = True
-					except Exception:
-						fetched = False
-				if not fetched:
-					try:
-						raw = download_from_storage(data_url)
-						img_bytes = raw
-						img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-						img_arr = np.array(img)
-					except Exception:
-						img_arr, img_bytes = decode_base64_image(data_url)
-		else:
-			raw = download_from_storage(temp_path)
-			img_bytes = raw
-			from PIL import Image as PILImage
-			import numpy as np
-			img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
-			img_arr = np.array(img)
+    try:
+        if data_url:
+            # Accept HTTP(S) URL, data URL, or treat as storage path. Prefer public URL.
+            if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
+                import requests
+                r = requests.get(data_url, timeout=20)
+                r.raise_for_status()
+                img_bytes = r.content
+                img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                img_arr = np.array(img)
+            elif isinstance(data_url, str) and data_url.startswith('data:'):
+                img_arr, img_bytes = decode_base64_image(data_url)
+            else:
+                fetched = False
+                if sb and SUPABASE_BUCKET:
+                    try:
+                        pub = _public_or_signed_url(data_url)
+                        if pub:
+                            import requests
+                            r = requests.get(pub, timeout=20)
+                            r.raise_for_status()
+                            img_bytes = r.content
+                            img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                            img_arr = np.array(img)
+                            fetched = True
+                    except Exception:
+                        fetched = False
+                if not fetched:
+                    try:
+                        raw = download_from_storage(data_url)
+                        img_bytes = raw
+                        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                        img_arr = np.array(img)
+                    except Exception:
+                        img_arr, img_bytes = decode_base64_image(data_url)
+        else:
+            raw = download_from_storage(temp_path)
+            img_bytes = raw
+            from PIL import Image as PILImage
+            import numpy as np
+            img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
+            img_arr = np.array(img)
 
-		save_debug_image('attach', img_arr)
+        save_debug_image('attach', img_arr)
 
-		# Insert user_images in its own transaction
-		try:
-			img_conn = get_db_conn()
-			img_cur = img_conn.cursor()
-			filename = f"{int(time.time())}_{uuid.uuid4().hex}.jpg"
-			storage_path = f"{user_id}/{filename}"
-			public_url = save_image_to_storage(storage_path, img_bytes) or storage_path
-			img_cur.execute(
-				"""
-					INSERT INTO public.user_images (user_id, storage_path, public_url, width, height, mime_type, uploaded_at, is_profile, file_size)
-					VALUES (%s, %s, %s, %s, %s, %s, now(), %s, %s)
-				""",
-				(
-					user_id,
-					storage_path,
-					public_url,
-					img_arr.shape[1],
-					img_arr.shape[0],
-					'image/jpeg',
-					True,
-					len(img_bytes),
-				),
-			)
-			img_conn.commit()
-		except Exception:
-			try:
-				img_conn.rollback()
-			except Exception:
-				pass
-			app.logger.exception('attach_image: failed to insert user_images')
-			return jsonify({'ok': False, 'error': 'image_save_failed'}), 500
-		finally:
-			try:
-				img_cur.close()
-				img_conn.close()
-			except Exception:
-				pass
+        # Insert user_images in its own transaction
+        try:
+            img_conn = get_db_conn()
+            img_cur = img_conn.cursor()
+            filename = f"{int(time.time())}_{uuid.uuid4().hex}.jpg"
+            storage_path = f"{user_id}/{filename}"
+            public_url = save_image_to_storage(storage_path, img_bytes) or storage_path
+            img_cur.execute(
+                """
+                    INSERT INTO public.user_images (user_id, storage_path, public_url, width, height, mime_type, uploaded_at, is_profile, file_size)
+                    VALUES (%s, %s, %s, %s, %s, %s, now(), %s, %s)
+                """,
+                (
+                    user_id,
+                    storage_path,
+                    public_url,
+                    img_arr.shape[1],
+                    img_arr.shape[0],
+                    'image/jpeg',
+                    True,
+                    len(img_bytes),
+                ),
+            )
+            img_conn.commit()
+        except Exception:
+            try:
+                img_conn.rollback()
+            except Exception:
+                pass
+            app.logger.exception('attach_image: failed to insert user_images')
+            return jsonify({'ok': False, 'error': 'image_save_failed'}), 500
+        finally:
+            try:
+                img_cur.close()
+                release_db_conn(img_conn)
+            except Exception:
+                try:
+                    release_db_conn(img_conn)
+                except Exception:
+                    pass
 
-		# Try to compute encoding and insert embedding separately
-		# This is optional - image attachment succeeds even without face encoding
-		try:
-			encoding = compute_face_encoding(img_arr)
-			if encoding is not None:
-				emb_conn = get_db_conn()
-				emb_cur = emb_conn.cursor()
-				try:
-					insert_embedding(emb_cur, user_id, encoding, 'attach')
-					emb_conn.commit()
-					app.logger.info('attach_image: embedding inserted successfully')
-				except Exception:
-					try:
-						emb_conn.rollback()
-					except Exception:
-						pass
-					app.logger.warning('attach_image: failed to insert embedding, continuing')
-				finally:
-					try:
-						emb_cur.close()
-						emb_conn.close()
-					except Exception:
-						pass
-			else:
-				app.logger.warning('attach_image: no encoding computed (face_recognition unavailable or no face)')
-		except Exception:
-			app.logger.warning('attach_image: encoding computation failed, continuing without embedding')
+        # Try to compute encoding and insert embedding separately
+        # This is optional - image attachment succeeds even without face encoding
+        try:
+            encoding = compute_face_encoding(img_arr)
+            if encoding is not None:
+                emb_conn = get_db_conn()
+                emb_cur = emb_conn.cursor()
+                try:
+                    insert_embedding(emb_cur, user_id, encoding, 'attach')
+                    emb_conn.commit()
+                    app.logger.info('attach_image: embedding inserted successfully')
+                except Exception:
+                    try:
+                        emb_conn.rollback()
+                    except Exception:
+                        pass
+                    app.logger.warning('attach_image: failed to insert embedding, continuing')
+                finally:
+                    try:
+                        emb_cur.close()
+                        release_db_conn(emb_conn)
+                    except Exception:
+                        try:
+                            release_db_conn(emb_conn)
+                        except Exception:
+                            pass
+            else:
+                app.logger.warning('attach_image: no encoding computed (face_recognition unavailable or no face)')
+        except Exception:
+            app.logger.warning('attach_image: encoding computation failed, continuing without embedding')
 
-		return jsonify({'ok': True, 'storage_path': storage_path, 'public_url': public_url}), 201
-	except Exception as exc:
-		app.logger.exception('attach_image: unexpected')
-		return jsonify({'ok': False, 'error': 'unexpected', 'detail': str(exc)}), 500
+        return jsonify({'ok': True, 'storage_path': storage_path, 'public_url': public_url}), 201
+    except Exception as exc:
+        app.logger.exception('attach_image: unexpected')
+        return jsonify({'ok': False, 'error': 'unexpected', 'detail': str(exc)}), 500
 
 
 @app.route('/api/login_face', methods=['POST'])
 def api_login_face():
-	"""Attempt face login using nearest-neighbor search.
-	
-	Requires pgvector extension and public.find_nearest_embeddings function.
-	Returns 501 if pgvector is not available.
-	"""
-	payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
-	# Accept either a data URL (`face_image` / `image`) or a storage path (`temp_storage_path` / `temp_path`)
-	data_url = payload.get('face_image') or payload.get('image')
-	temp_path = payload.get('temp_storage_path') or payload.get('temp_path')
-	storage_path = None
-	public_url = None
+    """Attempt face login using nearest-neighbor search.
+    
+    Requires pgvector extension and public.find_nearest_embeddings function.
+    Returns 501 if pgvector is not available.
+    """
+    payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+    # Accept either a data URL (`face_image` / `image`) or a storage path (`temp_storage_path` / `temp_path`)
+    data_url = payload.get('face_image') or payload.get('image')
+    temp_path = payload.get('temp_storage_path') or payload.get('temp_path')
+    storage_path = None
+    public_url = None
 
-	if not data_url and not temp_path:
-		return jsonify({'ok': False, 'error': 'missing_image'}), 400
-	# Accept temp storage path, data URL, HTTP(S) URL, or storage path.
-	try:
-		if temp_path:
-			# download the provided storage object and reuse its path (do NOT re-upload)
-			raw = download_from_storage(temp_path)
-			img_bytes = raw
-			from PIL import Image as PILImage
-			img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
-			img_arr = np.array(img)
-			storage_path = temp_path.lstrip('/')
-			public_url = _public_or_signed_url(storage_path) or storage_path
-		else:
-			# If data_url is an HTTP(S) URL, fetch it. If it's a data URL, decode locally.
-			if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
-				import requests
-				rep = requests.get(data_url, timeout=20)
-				rep.raise_for_status()
-				img_bytes = rep.content
-				img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-				img_arr = np.array(img)
-			elif isinstance(data_url, str) and data_url.startswith('data:'):
-				img_arr, img_bytes = decode_base64_image(data_url)
-			else:
-				# treat as storage path: prefer resolving a public URL and fetching
-				fetched = False
-				if sb and SUPABASE_BUCKET:
-					try:
-						pub = _public_or_signed_url(data_url)
-						if pub:
-							import requests
-							r = requests.get(pub, timeout=20)
-							r.raise_for_status()
-							img_bytes = r.content
-							img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-							img_arr = np.array(img)
-							fetched = True
-					except Exception:
-						fetched = False
-				if not fetched:
-					try:
-						raw = download_from_storage(data_url)
-						img_bytes = raw
-						img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-						img_arr = np.array(img)
-					except Exception:
-						# As a last resort, attempt to decode as data URL
-						img_arr, img_bytes = decode_base64_image(data_url)
-			# When not using temp_path, do not set storage_path/public_url here
-			if not temp_path:
-				storage_path = None
-				public_url = None
-	except Exception as exc:
-		return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
+    if not data_url and not temp_path:
+        return jsonify({'ok': False, 'error': 'missing_image'}), 400
+    # Accept temp storage path, data URL, HTTP(S) URL, or storage path.
+    try:
+        if temp_path:
+            # download the provided storage object and reuse its path (do NOT re-upload)
+            raw = download_from_storage(temp_path)
+            img_bytes = raw
+            from PIL import Image as PILImage
+            img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
+            img_arr = np.array(img)
+            storage_path = temp_path.lstrip('/')
+            public_url = _public_or_signed_url(storage_path) or storage_path
+        else:
+            # If data_url is an HTTP(S) URL, fetch it. If it's a data URL, decode locally.
+            if isinstance(data_url, str) and (data_url.startswith('http://') or data_url.startswith('https://')):
+                import requests
+                rep = requests.get(data_url, timeout=20)
+                rep.raise_for_status()
+                img_bytes = rep.content
+                img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                img_arr = np.array(img)
+            elif isinstance(data_url, str) and data_url.startswith('data:'):
+                img_arr, img_bytes = decode_base64_image(data_url)
+            else:
+                # treat as storage path: prefer resolving a public URL and fetching
+                fetched = False
+                if sb and SUPABASE_BUCKET:
+                    try:
+                        pub = _public_or_signed_url(data_url)
+                        if pub:
+                            import requests
+                            r = requests.get(pub, timeout=20)
+                            r.raise_for_status()
+                            img_bytes = r.content
+                            img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                            img_arr = np.array(img)
+                            fetched = True
+                    except Exception:
+                        fetched = False
+                if not fetched:
+                    try:
+                        raw = download_from_storage(data_url)
+                        img_bytes = raw
+                        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                        img_arr = np.array(img)
+                    except Exception:
+                        # As a last resort, attempt to decode as data URL
+                        img_arr, img_bytes = decode_base64_image(data_url)
+            # When not using temp_path, do not set storage_path/public_url here
+            if not temp_path:
+                storage_path = None
+                public_url = None
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': 'bad_image', 'detail': str(exc)}), 400
 
-	encoding = compute_face_encoding(img_arr)
-	if encoding is None:
-		return jsonify({'ok': False, 'error': 'no_face', 'message': 'No face detected. Ensure good lighting, clear focus on face, and try again.'}), 200
+    encoding = compute_face_encoding(img_arr)
+    if encoding is None:
+        return jsonify({'ok': False, 'error': 'no_face', 'message': 'No face detected. Ensure good lighting, clear focus on face, and try again.'}), 200
 
-	# Check if pgvector is available - required for nearest-neighbor lookup
-	use_vector = _detect_vector_type()
-	if not use_vector:
-		return jsonify({
-			'ok': False,
-			'error': 'nearest_embeddings_not_supported',
-			'detail': 'pgvector extension required for login_face. Enable pgvector in your Postgres database.'
-		}), 501
+    # Check if pgvector is available - required for nearest-neighbor lookup
+    use_vector = _detect_vector_type()
+    if not use_vector:
+        return jsonify({
+            'ok': False,
+            'error': 'nearest_embeddings_not_supported',
+            'detail': 'pgvector extension required for login_face. Enable pgvector in your Postgres database.'
+        }), 501
 
-	threshold = float(payload.get('threshold') or 0.5)
-	limit = int(payload.get('limit') or 1)
+    threshold = float(payload.get('threshold') or 0.5)
+    limit = int(payload.get('limit') or 1)
 
-	conn = get_db_conn()
-	cur = conn.cursor()
-	try:
-		# Use pgvector nearest-neighbor function
-		# Build the vector literal directly into SQL (safe because encoding is numeric list)
-		vec_vals = ','.join(str(float(x)) for x in encoding)
-		# Detect which schema contains the `vector` type and build a schema-qualified
-		# type reference. If detection fails, fall back to an unqualified `vector`.
-		v_schema = _detect_vector_schema()
-		if v_schema:
-			type_ref = f"{v_schema}.vector(128)"
-		else:
-			type_ref = "vector(128)"
-		# Prefer calling a helper, but if it's not present, run an inline NN query
-		# that computes distances directly against `public.embeddings`.
-		# This avoids requiring `public.find_nearest_embeddings` to exist.
-		inline_sql = f"""
-			SELECT e.id AS embedding_id, e.user_id, (e.embedding <-> ARRAY[{vec_vals}]::{type_ref}) AS dist
-			FROM public.embeddings e
-			ORDER BY dist
-			LIMIT %s
-		"""
-		# Try inline query first (more self-contained); if it fails due to missing
-		# vector type or operator, fall back to attempting the helper function.
-		try:
-			cur.execute(inline_sql, (limit,))
-		except Exception as db_exc:
-			# Detect missing pgvector type/errors and return a helpful 501
-			msg = str(db_exc).lower()
-			if 'type "vector" does not exist' in msg or 'pgvector' in msg or 'vector' in msg and 'does not exist' in msg:
-				app.logger.exception('login_face: vector type missing')
-				return jsonify({
-					'ok': False,
-					'error': 'nearest_embeddings_not_supported',
-					'detail': 'pgvector extension or vector type not available in DB. Install/enable pgvector and create the helper function find_nearest_embeddings.'
-				}), 501
-			raise
-		row = cur.fetchone()
-		if not row:
-			conn.commit()
-			cur.close()
-			conn.close()
-			return jsonify({'ok': False, 'error': 'no_match'}), 200
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        # Use pgvector nearest-neighbor function
+        # Build the vector literal directly into SQL (safe because encoding is numeric list)
+        vec_vals = ','.join(str(float(x)) for x in encoding)
+        # Detect which schema contains the `vector` type and build a schema-qualified
+        # type reference. If detection fails, fall back to an unqualified `vector`.
+        v_schema = _detect_vector_schema()
+        if v_schema:
+            type_ref = f"{v_schema}.vector(128)"
+        else:
+            type_ref = "vector(128)"
+        # Prefer calling a helper, but if it's not present, run an inline NN query
+        # that computes distances directly against `public.embeddings`.
+        # This avoids requiring `public.find_nearest_embeddings` to exist.
+        inline_sql = f"""
+            SELECT e.id AS embedding_id, e.user_id, (e.embedding <-> ARRAY[{vec_vals}]::{type_ref}) AS dist
+            FROM public.embeddings e
+            ORDER BY dist
+            LIMIT %s
+        """
+        # Try inline query first (more self-contained); if it fails due to missing
+        # vector type or operator, fall back to attempting the helper function.
+        try:
+            cur.execute(inline_sql, (limit,))
+        except Exception as db_exc:
+            # Detect missing pgvector type/errors and return a helpful 501
+            msg = str(db_exc).lower()
+            if 'type "vector" does not exist' in msg or 'pgvector' in msg or 'vector' in msg and 'does not exist' in msg:
+                app.logger.exception('login_face: vector type missing')
+                return jsonify({
+                    'ok': False,
+                    'error': 'nearest_embeddings_not_supported',
+                    'detail': 'pgvector extension or vector type not available in DB. Install/enable pgvector and create the helper function find_nearest_embeddings.'
+                }), 501
+            raise
+        row = cur.fetchone()
+        if not row:
+            conn.commit()
+            cur.close()
+            try:
+                release_db_conn(conn)
+            except Exception:
+                try:
+                    release_db_conn(conn)
+                except Exception:
+                    pass
+            return jsonify({'ok': False, 'error': 'no_match'}), 200
 
-		_, user_id, dist = row
-		if dist is None or float(dist) > threshold:
-			conn.commit()
-			cur.close()
-			conn.close()
-			return jsonify({'ok': False, 'error': 'no_match', 'min_distance': float(dist) if dist is not None else None}), 200
+        _, user_id, dist = row
+        if dist is None or float(dist) > threshold:
+            conn.commit()
+            cur.close()
+            try:
+                release_db_conn(conn)
+            except Exception:
+                try:
+                    release_db_conn(conn)
+                except Exception:
+                    pass
+            return jsonify({'ok': False, 'error': 'no_match', 'min_distance': float(dist) if dist is not None else None}), 200
 
-		cur.execute('SELECT id, display_name, username, email FROM public.users WHERE id = %s', (user_id,))
-		user_row = cur.fetchone()
-		conn.commit()
-	except Exception as exc:
-		try:
-			conn.rollback()
-		except Exception:
-			pass
-		app.logger.exception('login_face: db error')
-		# Check if error is due to missing find_nearest_embeddings function
-		if 'find_nearest_embeddings' in str(exc) or 'does not exist' in str(exc):
-			return jsonify({
-				'ok': False,
-				'error': 'nearest_embeddings_not_supported',
-				'detail': 'DB function find_nearest_embeddings not found. Create it using the SQL provided in supabase_setup.sql.'
-			}), 501
-		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-	finally:
-		try:
-			cur.close()
-		except Exception:
-			pass
-		try:
-			conn.close()
-		except Exception:
-			pass
+        cur.execute('SELECT id, display_name, username, email FROM public.users WHERE id = %s', (user_id,))
+        user_row = cur.fetchone()
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        app.logger.exception('login_face: db error')
+        # Check if error is due to missing find_nearest_embeddings function
+        if 'find_nearest_embeddings' in str(exc) or 'does not exist' in str(exc):
+            return jsonify({
+                'ok': False,
+                'error': 'nearest_embeddings_not_supported',
+                'detail': 'DB function find_nearest_embeddings not found. Create it using the SQL provided in supabase_setup.sql.'
+            }), 501
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            release_db_conn(conn)
+        except Exception:
+            try:
+                release_db_conn(conn)
+            except Exception:
+                pass
 
-	if not user_row:
-		return jsonify({'ok': False, 'error': 'user_missing'}), 404
+    if not user_row:
+        return jsonify({'ok': False, 'error': 'user_missing'}), 404
 
-	# Return storage info if we had a provided temp path
-	resp = {
-		'ok': True,
-		'user': {
-			'id': str(user_row[0]),
-			'display_name': user_row[1],
-			'username': user_row[2],
-			'email': user_row[3]
-		},
-		'distance': float(dist)
-	}
-	if storage_path:
-		resp['storage_path'] = storage_path
-		resp['public_url'] = public_url
-	return jsonify(resp), 200
+    # Return storage info if we had a provided temp path
+    resp = {
+        'ok': True,
+        'user': {
+            'id': str(user_row[0]),
+            'display_name': user_row[1],
+            'username': user_row[2],
+            'email': user_row[3]
+        },
+        'distance': float(dist)
+    }
+    if storage_path:
+        resp['storage_path'] = storage_path
+        resp['public_url'] = public_url
+    return jsonify(resp), 200
 
 
 @app.route('/api/admin/embeddings', methods=['GET'])
 def api_admin_embeddings():
-	"""Admin helper: return embedding metadata for a user. Not secure; intended for local testing only."""
-	user_id = request.args.get('user_id')
-	if not user_id:
-		return jsonify({'ok': False, 'error': 'missing_user_id'}), 400
-	try:
-		conn = get_db_conn()
-		cur = conn.cursor()
-		cur.execute("SELECT id, user_id, source, created_at, (embedding IS NOT NULL) as has_embedding FROM public.embeddings WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
-		rows = cur.fetchall()
-		items = []
-		for r in rows:
-			items.append({'id': str(r[0]), 'user_id': str(r[1]), 'source': r[2], 'created_at': r[3].isoformat() if getattr(r[3],'isoformat',None) else str(r[3]), 'has_embedding': bool(r[4])})
-		cur.close()
-		conn.close()
-		return jsonify({'ok': True, 'count': len(items), 'items': items}), 200
-	except Exception as exc:
-		app.logger.exception('admin/embeddings: db error')
-		try:
-			cur.close()
-		except Exception:
-			pass
-		try:
-			conn.close()
-		except Exception:
-			pass
-		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+    """Admin helper: return embedding metadata for a user. Not secure; intended for local testing only."""
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({'ok': False, 'error': 'missing_user_id'}), 400
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT id, user_id, source, created_at, (embedding IS NOT NULL) as has_embedding FROM public.embeddings WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
+        rows = cur.fetchall()
+        items = []
+        for r in rows:
+            items.append({'id': str(r[0]), 'user_id': str(r[1]), 'source': r[2], 'created_at': r[3].isoformat() if getattr(r[3],'isoformat',None) else str(r[3]), 'has_embedding': bool(r[4])})
+        cur.close()
+        try:
+            release_db_conn(conn)
+        except Exception:
+            try:
+                release_db_conn(conn)
+            except Exception:
+                pass
+        return jsonify({'ok': True, 'count': len(items), 'items': items}), 200
+    except Exception as exc:
+        app.logger.exception('admin/embeddings: db error')
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            release_db_conn(conn)
+        except Exception:
+            try:
+                release_db_conn(conn)
+            except Exception:
+                pass
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
 @app.route('/api/users/<user_id>', methods=['GET'])
 def api_get_user(user_id):
-	"""Return user record, images and embedding metadata."""
-	# Only allow the owner (actor) to read this user's details
-	actor = _get_actor_user_id()
-	if not actor or str(actor) != str(user_id):
-		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+    """Return user record, images and embedding metadata."""
+    # Only allow the owner (actor) to read this user's details
+    actor = _get_actor_user_id()
+    if not actor or str(actor) != str(user_id):
+        return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
 
-	try:
-		conn = get_db_conn()
-		cur = conn.cursor()
-		cur.execute("SELECT id, display_name, username, email, phone, date_of_birth, emergency_contact, medications, allergies, accessibility_needs, preferred_language, created_at FROM public.users WHERE id = %s", (user_id,))
-		row = cur.fetchone()
-		if not row:
-			cur.close()
-			conn.close()
-			return jsonify({'ok': False, 'error': 'user_missing'}), 404
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT id, display_name, username, email, phone, date_of_birth, emergency_contact, medications, allergies, accessibility_needs, preferred_language, created_at FROM public.users WHERE id = %s", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            try:
+                release_db_conn(conn)
+            except Exception:
+                try:
+                    release_db_conn(conn)
+                except Exception:
+                    pass
+            return jsonify({'ok': False, 'error': 'user_missing'}), 404
 
-		user = {
-			'id': str(row[0]),
-			'display_name': row[1],
-			'username': row[2],
-			'email': row[3],
-			'phone': row[4],
-			'date_of_birth': row[5],
-			'emergency_contact': row[6],
-			'medications': row[7],
-			'allergies': row[8],
-			'accessibility_needs': row[9],
-			'preferred_language': row[10],
-			'created_at': row[11].isoformat() if getattr(row[11], 'isoformat', None) else str(row[11])
-		}
+        user = {
+            'id': str(row[0]),
+            'display_name': row[1],
+            'username': row[2],
+            'email': row[3],
+            'phone': row[4],
+            'date_of_birth': row[5],
+            'emergency_contact': row[6],
+            'medications': row[7],
+            'allergies': row[8],
+            'accessibility_needs': row[9],
+            'preferred_language': row[10],
+            'created_at': row[11].isoformat() if getattr(row[11], 'isoformat', None) else str(row[11])
+        }
 
-		cur.execute("SELECT id, storage_path, public_url, is_profile, uploaded_at FROM public.user_images WHERE user_id = %s ORDER BY uploaded_at DESC", (user_id,))
-		images = []
-		for r in cur.fetchall():
-			images.append({'id': str(r[0]), 'storage_path': r[1], 'public_url': r[2], 'is_profile': bool(r[3]), 'uploaded_at': r[4].isoformat() if getattr(r[4], 'isoformat', None) else str(r[4])})
+        cur.execute("SELECT id, storage_path, public_url, is_profile, uploaded_at FROM public.user_images WHERE user_id = %s ORDER BY uploaded_at DESC", (user_id,))
+        images = []
+        for r in cur.fetchall():
+            images.append({'id': str(r[0]), 'storage_path': r[1], 'public_url': r[2], 'is_profile': bool(r[3]), 'uploaded_at': r[4].isoformat() if getattr(r[4], 'isoformat', None) else str(r[4])})
 
-		cur.execute("SELECT count(*) FROM public.embeddings WHERE user_id = %s", (user_id,))
-		emb_count = cur.fetchone()[0]
+        cur.execute("SELECT count(*) FROM public.embeddings WHERE user_id = %s", (user_id,))
+        emb_count = cur.fetchone()[0]
 
-		cur.close()
-		conn.close()
-		return jsonify({'ok': True, 'user': user, 'images': images, 'embedding_count': int(emb_count)}), 200
-	except Exception as exc:
-		app.logger.exception('get_user: db error')
-		try:
-			cur.close()
-		except Exception:
-			pass
-		try:
-			conn.close()
-		except Exception:
-			pass
-		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+        cur.close()
+        try:
+            release_db_conn(conn)
+        except Exception:
+            try:
+                release_db_conn(conn)
+            except Exception:
+                pass
+        return jsonify({'ok': True, 'user': user, 'images': images, 'embedding_count': int(emb_count)}), 200
+    except Exception as exc:
+        app.logger.exception('get_user: db error')
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            release_db_conn(conn)
+        except Exception:
+            try:
+                release_db_conn(conn)
+            except Exception:
+                pass
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
 @app.route('/api/users/<user_id>', methods=['PUT'])
 def api_update_user(user_id):
-	"""Update allowed user fields."""
-	payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
-	allowed = ['display_name', 'email', 'phone', 'date_of_birth', 'emergency_contact', 'medications', 'allergies', 'accessibility_needs', 'preferred_language']
-	updates = {}
-	for k in allowed:
-		if k in payload:
-			updates[k] = payload.get(k)
+    """Update allowed user fields."""
+    payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+    allowed = ['display_name', 'email', 'phone', 'date_of_birth', 'emergency_contact', 'medications', 'allergies', 'accessibility_needs', 'preferred_language']
+    updates = {}
+    for k in allowed:
+        if k in payload:
+            updates[k] = payload.get(k)
 
-	if not updates:
-		return jsonify({'ok': False, 'error': 'no_updates'}), 400
+    if not updates:
+        return jsonify({'ok': False, 'error': 'no_updates'}), 400
 
-	# Owner-only: ensure caller is the same user
-	actor = _get_actor_user_id()
-	if not actor or str(actor) != str(user_id):
-		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+    # Owner-only: ensure caller is the same user
+    actor = _get_actor_user_id()
+    if not actor or str(actor) != str(user_id):
+        return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
 
-	try:
-		conn = get_db_conn()
-		cur = conn.cursor()
-		try:
-			try:
-				from psycopg2.extras import Json
-			except Exception:
-				Json = lambda x: json.dumps(x) if x is not None else None
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            try:
+                from psycopg2.extras import Json
+            except Exception:
+                Json = lambda x: json.dumps(x) if x is not None else None
 
-			set_clauses = []
-			params = []
-			for k, v in updates.items():
-				if k in ('emergency_contact', 'medications'):
-					set_clauses.append(f"{k} = %s")
-					params.append(Json(v) if v is not None else None)
-				else:
-					set_clauses.append(f"{k} = %s")
-					params.append(v)
+            set_clauses = []
+            params = []
+            for k, v in updates.items():
+                if k in ('emergency_contact', 'medications'):
+                    set_clauses.append(f"{k} = %s")
+                    params.append(Json(v) if v is not None else None)
+                else:
+                    set_clauses.append(f"{k} = %s")
+                    params.append(v)
 
-			params.append(user_id)
-			sql = f"UPDATE public.users SET {', '.join(set_clauses)} WHERE id = %s RETURNING id"
-			cur.execute(sql, tuple(params))
-			if not cur.fetchone():
-				conn.rollback()
-				cur.close()
-				conn.close()
-				return jsonify({'ok': False, 'error': 'user_missing'}), 404
-			conn.commit()
-		except Exception as exc:
-			conn.rollback()
-			app.logger.exception('update_user: db error')
-			cur.close()
-			conn.close()
-			return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
-		cur.close()
-		conn.close()
-		return jsonify({'ok': True}), 200
-	except Exception as exc:
-		app.logger.exception('update_user: unexpected')
-		try:
-			cur.close()
-		except Exception:
-			pass
-		try:
-			conn.close()
-		except Exception:
-			pass
-		return jsonify({'ok': False, 'error': 'unexpected', 'detail': str(exc)}), 500
+            params.append(user_id)
+            sql = f"UPDATE public.users SET {', '.join(set_clauses)} WHERE id = %s RETURNING id"
+            cur.execute(sql, tuple(params))
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                cur.close()
+                return jsonify({'ok': False, 'error': 'user_missing'}), 404
+            conn.commit()
+            cur.close()
+        return jsonify({'ok': True}), 200
+    except Exception as exc:
+        app.logger.exception('update_user: db error')
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+    except Exception as exc:
+        app.logger.exception('update_user: unexpected')
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            release_db_conn(conn)
+        except Exception:
+            try:
+                release_db_conn(conn)
+            except Exception:
+                pass
+        return jsonify({'ok': False, 'error': 'unexpected', 'detail': str(exc)}), 500
 
 
 @app.route('/api/users/<user_id>', methods=['DELETE'])
 def api_delete_user(user_id):
-	"""Delete user and related DB rows. Attempts to remove storage files if configured.
-	Returns list of removed storage paths (DB rows) so client can confirm storage cleanup.
-	"""
-	# Owner-only: ensure caller is the same user
-	actor = _get_actor_user_id()
-	if not actor or str(actor) != str(user_id):
-		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+    """Delete user and related DB rows. Attempts to remove storage files if configured.
+    Returns list of removed storage paths (DB rows) so client can confirm storage cleanup.
+    """
+    # Owner-only: ensure caller is the same user
+    actor = _get_actor_user_id()
+    if not actor or str(actor) != str(user_id):
+        return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
 
-	try:
-		conn = get_db_conn()
-		cur = conn.cursor()
-		# collect user image paths
-		cur.execute("SELECT storage_path FROM public.user_images WHERE user_id = %s", (user_id,))
-		paths = [r[0] for r in cur.fetchall() if r[0]]
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            # collect user image paths
+            cur.execute("SELECT storage_path FROM public.user_images WHERE user_id = %s", (user_id,))
+            paths = [r[0] for r in cur.fetchall() if r[0]]
 
-		# delete embeddings, images, then user
-		cur.execute("DELETE FROM public.embeddings WHERE user_id = %s", (user_id,))
-		cur.execute("DELETE FROM public.user_images WHERE user_id = %s", (user_id,))
-		cur.execute("DELETE FROM public.users WHERE id = %s RETURNING id", (user_id,))
-		res = cur.fetchone()
-		if not res:
-			conn.rollback()
-			cur.close()
-			conn.close()
-			return jsonify({'ok': False, 'error': 'user_missing'}), 404
-		conn.commit()
-		cur.close()
-		conn.close()
+            # delete embeddings, images, then user
+            cur.execute("DELETE FROM public.embeddings WHERE user_id = %s", (user_id,))
+            cur.execute("DELETE FROM public.user_images WHERE user_id = %s", (user_id,))
+            cur.execute("DELETE FROM public.users WHERE id = %s RETURNING id", (user_id,))
+            res = cur.fetchone()
+            if not res:
+                conn.rollback()
+                cur.close()
+                return jsonify({'ok': False, 'error': 'user_missing'}), 404
+            conn.commit()
+            cur.close()
 
-		removed_paths = []
-		if sb and SUPABASE_BUCKET and paths:
-			try:
-				for p in paths:
-					try:
-						# supabase storage client may accept list or single path depending on SDK
-						sb.storage.from_(SUPABASE_BUCKET).remove([p])
-						removed_paths.append(p)
-					except Exception:
-						app.logger.exception('failed to remove storage path: %s', p)
-			except Exception:
-				app.logger.exception('storage removal error')
+        removed_paths = []
+        if sb and SUPABASE_BUCKET and paths:
+            try:
+                for p in paths:
+                    try:
+                        # supabase storage client may accept list or single path depending on SDK
+                        sb.storage.from_(SUPABASE_BUCKET).remove([p])
+                        removed_paths.append(p)
+                    except Exception:
+                        app.logger.exception('failed to remove storage path: %s', p)
+            except Exception:
+                app.logger.exception('storage removal error')
 
-		return jsonify({'ok': True, 'removed_storage_paths': removed_paths}), 200
-	except Exception as exc:
-		app.logger.exception('delete_user: db error')
-		try:
-			cur.close()
-		except Exception:
-			pass
-		try:
-			conn.close()
-		except Exception:
-			pass
-		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+        return jsonify({'ok': True, 'removed_storage_paths': removed_paths}), 200
+    except Exception as exc:
+        app.logger.exception('delete_user: db error')
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
 @app.route('/api/user_images/<image_id>', methods=['DELETE'])
 def api_delete_image(image_id):
-	"""Delete a single user_images row and attempt storage removal."""
-	# Owner-only: only the owner of the image may delete it. We verify by
-	# checking the image row's user_id against the caller identity.
-	actor = _get_actor_user_id()
-	if not actor:
-		return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'missing actor identity'}), 403
+    """Delete a single user_images row and attempt storage removal."""
+    # Owner-only: only the owner of the image may delete it. We verify by
+    # checking the image row's user_id against the caller identity.
+    actor = _get_actor_user_id()
+    if not actor:
+        return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'missing actor identity'}), 403
 
-	try:
-		conn = get_db_conn()
-		cur = conn.cursor()
-		cur.execute("SELECT storage_path FROM public.user_images WHERE id = %s", (image_id,))
-		row = cur.fetchone()
-		if not row:
-			cur.close()
-			conn.close()
-			return jsonify({'ok': False, 'error': 'image_missing'}), 404
-		path = row[0]
-		# verify ownership
-		cur.execute("SELECT user_id FROM public.user_images WHERE id = %s", (image_id,))
-		owner_row = cur.fetchone()
-		if not owner_row or str(owner_row[0]) != str(actor):
-			cur.close()
-			conn.close()
-			return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'not image owner'}), 403
-		cur.execute("DELETE FROM public.user_images WHERE id = %s RETURNING id", (image_id,))
-		res = cur.fetchone()
-		if not res:
-			conn.rollback()
-			cur.close()
-			conn.close()
-			return jsonify({'ok': False, 'error': 'delete_failed'}), 500
-		conn.commit()
-		cur.close()
-		conn.close()
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT storage_path FROM public.user_images WHERE id = %s", (image_id,))
+            row = cur.fetchone()
+            if not row:
+                cur.close()
+                return jsonify({'ok': False, 'error': 'image_missing'}), 404
+            path = row[0]
+            # verify ownership
+            cur.execute("SELECT user_id FROM public.user_images WHERE id = %s", (image_id,))
+            owner_row = cur.fetchone()
+            if not owner_row or str(owner_row[0]) != str(actor):
+                cur.close()
+                return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'not image owner'}), 403
+            cur.execute("DELETE FROM public.user_images WHERE id = %s RETURNING id", (image_id,))
+            res = cur.fetchone()
+            if not res:
+                conn.rollback()
+                cur.close()
+                return jsonify({'ok': False, 'error': 'delete_failed'}), 500
+            conn.commit()
+            cur.close()
 
-		removed = False
-		if sb and SUPABASE_BUCKET and path:
-			try:
-				sb.storage.from_(SUPABASE_BUCKET).remove([path])
-				removed = True
-			except Exception:
-				app.logger.exception('delete_image: storage remove failed for %s', path)
+        removed = False
+        if sb and SUPABASE_BUCKET and path:
+            try:
+                sb.storage.from_(SUPABASE_BUCKET).remove([path])
+                removed = True
+            except Exception:
+                app.logger.exception('delete_image: storage remove failed for %s', path)
 
-		return jsonify({'ok': True, 'removed_from_storage': removed, 'storage_path': path}), 200
-	except Exception as exc:
-		app.logger.exception('delete_image: db error')
-		try:
-			cur.close()
-		except Exception:
-			pass
-		try:
-			conn.close()
-		except Exception:
-			pass
-		return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+        return jsonify({'ok': True, 'removed_from_storage': removed, 'storage_path': path}), 200
+    except Exception as exc:
+        app.logger.exception('delete_image: db error')
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
 
@@ -1662,22 +1775,23 @@ def api_delete_image(image_id):
 @app.route('/api/users/<user_id>/medications', methods=['GET'])
 def api_list_medications(user_id):
     """List all medications for a user."""
-    conn = None
     try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, name, dosage, frequency, time, instructions, created_at, updated_at
-            FROM public.user_medications
-            WHERE user_id = %s
-            ORDER BY created_at DESC
-        """, (user_id,))
-        rows = cur.fetchall()
-        cur.close()
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, name, dosage, frequency, time, instructions, created_at, updated_at
+                FROM public.user_medications
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                """,
+                (user_id,),
+            )
+            rows = cur.fetchall()
+            cur.close()
 
-        items = []
-        for row in rows:
-            items.append({
+        items = [
+            {
                 'id': str(row[0]),
                 'name': row[1],
                 'dosage': row[2],
@@ -1686,28 +1800,44 @@ def api_list_medications(user_id):
                 'instructions': row[5],
                 'created_at': row[6].isoformat() if row[6] else None,
                 'updated_at': row[7].isoformat() if row[7] else None,
-            })
+            }
+            for row in rows
+        ]
 
-        conn.close()
         return jsonify({'ok': True, 'count': len(items), 'items': items}), 200
     except Exception as exc:
         app.logger.exception('list_medications: error')
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
         return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
+
+# Monkeypatch psycopg2 connection `.close()` to route through `release_db_conn`
+# This ensures existing callsites that invoke `.close()` will return the
+# connection to the pool when possible, preventing pool leaks.
+try:
+    import psycopg2
+    try:
+        from psycopg2.extensions import connection as _pg_conn_cls
+        _orig_conn_close = getattr(_pg_conn_cls, 'close', None)
+        def _patched_conn_close(self, *a, **k):
+            try:
+                release_db_conn(self)
+            except Exception:
+                try:
+                    if _orig_conn_close:
+                        _orig_conn_close(self)
+                except Exception:
+                    pass
+        if _pg_conn_cls and _orig_conn_close:
+            _pg_conn_cls.close = _patched_conn_close
+    except Exception:
+        pass
+except Exception:
+    pass
 
 
 @app.route('/api/users/<user_id>/medications', methods=['POST'])
 def api_create_medication(user_id):
-    """Create a new medication for a user."""
-    actor = _get_actor_user_id()
-    if not actor or str(actor) != str(user_id):
-        return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
-
+    """Create a medication for a user."""
     payload = request.get_json(force=True, silent=True) or {}
     name = (payload.get('name') or '').strip()
     if not name:
@@ -1718,19 +1848,20 @@ def api_create_medication(user_id):
     time_val = payload.get('time')
     instructions = payload.get('instructions')
 
-    conn = None
     try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO public.user_medications (user_id, name, dosage, frequency, time, instructions)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            RETURNING id, user_id, name, dosage, frequency, time, instructions, created_at, updated_at
-        """, (user_id, name, dosage, frequency, time_val, instructions))
-        row = cur.fetchone()
-        conn.commit()
-        cur.close()
-        conn.close()
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO public.user_medications (user_id, name, dosage, frequency, time, instructions)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id, user_id, name, dosage, frequency, time, instructions, created_at, updated_at
+                """,
+                (user_id, name, dosage, frequency, time_val, instructions),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            cur.close()
 
         medication = {
             'id': str(row[0]),
@@ -1747,15 +1878,6 @@ def api_create_medication(user_id):
         return jsonify({'ok': True, 'medication': medication}), 201
     except Exception as exc:
         app.logger.exception('create_medication: error')
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
         return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
@@ -1784,51 +1906,39 @@ def api_update_medication(user_id, med_id):
     set_clauses.append("updated_at = NOW()")
     params.extend([med_id, user_id])
 
-    conn = None
     try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        sql = f"""
-            UPDATE public.user_medications
-            SET {', '.join(set_clauses)}
-            WHERE id = %s AND user_id = %s
-            RETURNING id, name, dosage, frequency, time, instructions, updated_at
-        """
-        cur.execute(sql, tuple(params))
-        row = cur.fetchone()
+        with db_conn() as conn:
+            cur = conn.cursor()
+            sql = f"""
+                UPDATE public.user_medications
+                SET {', '.join(set_clauses)}
+                WHERE id = %s AND user_id = %s
+                RETURNING id, name, dosage, frequency, time, instructions, updated_at
+            """
+            cur.execute(sql, tuple(params))
+            row = cur.fetchone()
 
-        if not row:
-            conn.rollback()
+            if not row:
+                conn.rollback()
+                cur.close()
+                return jsonify({'ok': False, 'error': 'medication_missing'}), 404
+
+            conn.commit()
             cur.close()
-            conn.close()
-            return jsonify({'ok': False, 'error': 'medication_missing'}), 404
 
-        conn.commit()
-        cur.close()
-        conn.close()
+            medication = {
+                'id': str(row[0]),
+                'name': row[1],
+                'dosage': row[2],
+                'frequency': row[3],
+                'time': row[4],
+                'instructions': row[5],
+                'updated_at': row[6].isoformat() if row[6] else None,
+            }
 
-        medication = {
-            'id': str(row[0]),
-            'name': row[1],
-            'dosage': row[2],
-            'frequency': row[3],
-            'time': row[4],
-            'instructions': row[5],
-            'updated_at': row[6].isoformat() if row[6] else None,
-        }
-
-        return jsonify({'ok': True, 'medication': medication}), 200
+            return jsonify({'ok': True, 'medication': medication}), 200
     except Exception as exc:
         app.logger.exception('update_medication: error')
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
         return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
@@ -1840,43 +1950,31 @@ def api_delete_medication(user_id, med_id):
     if not actor or str(actor) != str(user_id):
         return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
 
-    conn = None
     try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            DELETE FROM public.user_medications
-            WHERE id = %s AND user_id = %s
-            RETURNING id
-        """, (med_id, user_id))
-        row = cur.fetchone()
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                DELETE FROM public.user_medications
+                WHERE id = %s AND user_id = %s
+                RETURNING id
+            """, (med_id, user_id))
+            row = cur.fetchone()
 
-        if not row:
-            conn.rollback()
+            if not row:
+                conn.rollback()
+                cur.close()
+                return jsonify({'ok': False, 'error': 'medication_missing'}), 404
+
+            conn.commit()
             cur.close()
-            conn.close()
-            return jsonify({'ok': False, 'error': 'medication_missing'}), 404
 
-        conn.commit()
-        cur.close()
-        conn.close()
-
-        return jsonify({'ok': True}), 200
+            return jsonify({'ok': True}), 200
     except Exception as exc:
         app.logger.exception('delete_medication: error')
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
         return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
 if __name__ == '__main__':
-	os.makedirs(DATA_DIR, exist_ok=True)
-	print('webapp.py: launching Flask on http://0.0.0.0:5000', flush=True)
-	app.run(host='0.0.0.0', port=5000, debug=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    print('webapp.py: launching Flask on http://0.0.0.0:5000', flush=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
