@@ -4,9 +4,6 @@ import os
 import time
 import uuid
 from typing import Tuple, Optional
-
-from flask import Flask, jsonify, render_template, request
-from flask_cors import CORS
 from PIL import Image
 from contextlib import contextmanager
 import threading
@@ -15,6 +12,10 @@ import logging
 import sys
 import json
 import numpy as np
+
+# Flask imports
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 load_dotenv()
 SUPABASE_URL = os.getenv('SUPABASE_URL')
@@ -86,6 +87,12 @@ _vector_detect_lock = threading.Lock()
 
 def _detect_vector_type() -> bool:
     global _HAS_VECTOR
+    # Enable DB-based detection by default. To opt out/set to disabled,
+    # define `DISABLE_PGVECTOR_DETECTION=true` in the environment.
+    if os.getenv('DISABLE_PGVECTOR_DETECTION', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        _HAS_VECTOR = False
+        return False
+
     # Fast path: cached positive result
     if _HAS_VECTOR is True:
         return True
@@ -101,7 +108,7 @@ def _detect_vector_type() -> bool:
                 _HAS_VECTOR = bool(cur.fetchone()[0])
                 cur.close()
         except Exception:
-            app.logger.exception('error detecting pgvector type')
+            app.logger.debug('error detecting pgvector type (disabled or DB error)')
             _HAS_VECTOR = False
     return _HAS_VECTOR
 
@@ -120,13 +127,17 @@ def _detect_vector_schema() -> Optional[str]:
     the extension is installed into a non-public schema (e.g. `vector_ext`).
     The result is cached in `_VECTOR_SCHEMA` but will be rechecked if None.
     """
+    # Avoid querying the DB for schema detection when explicitly disabled.
+    # By default this will run as part of detection; set `DISABLE_PGVECTOR_DETECTION`
+    # to opt out.
+    if os.getenv('DISABLE_PGVECTOR_DETECTION', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        return None
     global _VECTOR_SCHEMA
     if _VECTOR_SCHEMA is not None:
         return _VECTOR_SCHEMA
     try:
         conn = get_db_conn()
         cur = conn.cursor()
-        # Find the namespace (schema) that defines a type named 'vector'
         cur.execute("""
             SELECT n.nspname
             FROM pg_type t
@@ -611,20 +622,14 @@ def list_routes():
 
 @app.route('/', methods=['GET'])
 def index():
-    template = app.template_folder or ''
-    index_path = os.path.join(template, 'index.html')
-    if template and os.path.exists(index_path):
-        return render_template('index.html')
-    return 'OK'
+    # API-only mode: do not render HTML templates. Return simple OK.
+    return jsonify({'ok': True, 'app': 'face-recognition-backend'}), 200
 
 
 @app.route('/signup', methods=['GET'])
 def signup():
-    tmpl = app.template_folder or ''
-    page = os.path.join(tmpl, 'welcome.html')
-    if tmpl and os.path.exists(page):
-        return render_template('welcome.html')
-    return render_template('index.html') if os.path.exists(os.path.join(tmpl, 'index.html')) else 'Signup'
+    # Signup page removed in API-only mode
+    return jsonify({'ok': False, 'error': 'html_frontend_removed'}), 404
 
 
 
@@ -1387,8 +1392,10 @@ def api_login_face():
     cur = conn.cursor()
     try:
         # Use pgvector nearest-neighbor function
-        # Build the vector literal directly into SQL (safe because encoding is numeric list)
-        vec_vals = ','.join(str(float(x)) for x in encoding)
+        # Pass the embedding as a parameterized array instead of building
+        # the numeric literal inline. This avoids very large SQL strings
+        # and reduces parser/operator-related crash risk on the server.
+        vec_vals = [float(x) for x in encoding]
         # Detect which schema contains the `vector` type and build a schema-qualified
         # type reference. If detection fails, fall back to an unqualified `vector`.
         v_schema = _detect_vector_schema()
@@ -1400,7 +1407,7 @@ def api_login_face():
         # that computes distances directly against `public.embeddings`.
         # This avoids requiring `public.find_nearest_embeddings` to exist.
         inline_sql = f"""
-            SELECT e.id AS embedding_id, e.user_id, (e.embedding <-> ARRAY[{vec_vals}]::{type_ref}) AS dist
+            SELECT e.id AS embedding_id, e.user_id, (e.embedding <-> %s::{type_ref}) AS dist
             FROM public.embeddings e
             ORDER BY dist
             LIMIT %s
@@ -1408,7 +1415,15 @@ def api_login_face():
         # Try inline query first (more self-contained); if it fails due to missing
         # vector type or operator, fall back to attempting the helper function.
         try:
-            cur.execute(inline_sql, (limit,))
+            # Log metadata (but avoid dumping the full embedding) to help debug
+            # server-side failures without leaking sensitive data.
+            try:
+                app.logger.debug('login_face: executing inline_sql; type_ref=%s, embedding_len=%d, limit=%d', type_ref, len(vec_vals), limit)
+            except Exception:
+                app.logger.debug('login_face: executing inline_sql (metadata logging failed)')
+            # Pass the Python list (vec_vals) as a parameter; psycopg2 adapts it
+            # to a Postgres array literal which we then cast to the vector type.
+            cur.execute(inline_sql, (vec_vals, limit))
         except Exception as db_exc:
             # Detect missing pgvector type/errors and return a helpful 501
             msg = str(db_exc).lower()
