@@ -1061,6 +1061,40 @@ def api_register():
             except Exception:
                 pass
 
+    # Persist any provided medications into the `user_medications` table
+    # so they are available via the medications CRUD endpoints. Accepts
+    # either a list of strings or a list of objects with fields.
+    try:
+        if medications:
+            with db_conn() as conn:
+                cur = conn.cursor()
+                for m in medications:
+                    if isinstance(m, dict):
+                        name = m.get('name') or m.get('medication') or None
+                        dosage = m.get('dosage')
+                        frequency = m.get('frequency')
+                        time_val = m.get('time')
+                        instructions = m.get('instructions')
+                    else:
+                        name = str(m).strip()
+                        dosage = None
+                        frequency = None
+                        time_val = None
+                        instructions = None
+                    if not name:
+                        continue
+                    cur.execute(
+                        """
+                        INSERT INTO public.user_medications (user_id, name, dosage, frequency, time, instructions)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (user_id, name, dosage, frequency, time_val, instructions),
+                    )
+                conn.commit()
+                cur.close()
+    except Exception:
+        app.logger.exception('register: failed to persist medications to user_medications')
+
     # If the client provided an image data URL or temp path, attach it to the user and insert embedding
     image_data_url = payload.get('image') or payload.get('face_image') or payload.get('image_url')
     temp_path = payload.get('temp_storage_path') or payload.get('temp_path')
@@ -1596,7 +1630,29 @@ def api_get_user(user_id):
 
         cur.execute("SELECT count(*) FROM public.embeddings WHERE user_id = %s", (user_id,))
         emb_count = cur.fetchone()[0]
-
+        # Also fetch row-level medications stored in `user_medications` table
+        try:
+            cur.execute(
+                "SELECT id, name, dosage, frequency, time, instructions, created_at, updated_at FROM public.user_medications WHERE user_id = %s ORDER BY created_at DESC",
+                (user_id,),
+            )
+            meds_rows = cur.fetchall()
+            medications_list = [
+                {
+                    'id': str(r[0]),
+                    'name': r[1],
+                    'dosage': r[2],
+                    'frequency': r[3],
+                    'time': r[4],
+                    'instructions': r[5],
+                    'created_at': r[6].isoformat() if getattr(r[6], 'isoformat', None) else str(r[6]),
+                    'updated_at': r[7].isoformat() if getattr(r[7], 'isoformat', None) else str(r[7]),
+                }
+                for r in meds_rows
+            ]
+        except Exception:
+            app.logger.exception('get_user: failed to fetch user_medications')
+            medications_list = []
         cur.close()
         try:
             release_db_conn(conn)
