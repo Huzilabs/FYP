@@ -10,3 +10,4 @@ requests
 
 Flask-Cors
 gunicorn
+setuptools<81

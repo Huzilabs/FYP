@@ -6,3 +6,4 @@ python-dotenv
 supabase
 psycopg2-binary
 requests
+setuptools<81
