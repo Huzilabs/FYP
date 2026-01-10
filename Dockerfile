@@ -27,7 +27,7 @@ WORKDIR /app
 # Copy dependency files first for better layer caching
 COPY requirements.txt /app/requirements.txt
 
-RUN pip install --upgrade pip setuptools wheel
+RUN pip install --upgrade pip "setuptools<81" wheel
 RUN pip install -r /app/requirements.txt
 
 # Copy application source
