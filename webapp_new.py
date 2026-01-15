@@ -2070,6 +2070,329 @@ def api_delete_medication(user_id, med_id):
         return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
+# ============ WORKOUT ENDPOINTS ============
+
+@app.route('/api/workouts/templates', methods=['GET'])
+def api_list_workout_templates():
+    """List all workout templates with editable_by_user flag."""
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, name, default_step_count, default_duration_minutes, editable_by_user
+                FROM public.workout_templates
+                ORDER BY name
+            """)
+            rows = cur.fetchall()
+            cur.close()
+
+        items = [
+            {
+                'id': str(row[0]),
+                'name': row[1],
+                'default_step_count': row[2],
+                'default_duration_minutes': row[3],
+                'editable_by_user': bool(row[4])
+            }
+            for row in rows
+        ]
+
+        return jsonify({'ok': True, 'templates': items}), 200
+    except Exception as exc:
+        app.logger.exception('list_workout_templates: error')
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+@app.route('/api/users/<user_id>/workouts', methods=['GET'])
+def api_list_user_workouts(user_id):
+    """List all templates merged with user's current values and total steps."""
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+
+            # Get merged view of templates and user values
+            cur.execute("""
+                SELECT
+                    wt.id AS template_id,
+                    wt.name,
+                    uw.id AS user_workout_id,
+                    COALESCE(uw.step_count, wt.default_step_count) AS step_count,
+                    COALESCE(uw.duration_minutes, wt.default_duration_minutes) AS duration_minutes,
+                    wt.editable_by_user,
+                    uw.updated_at
+                FROM public.workout_templates wt
+                LEFT JOIN public.user_workouts uw ON uw.template_id = wt.id AND uw.user_id = %s
+                ORDER BY wt.name
+            """, (user_id,))
+            rows = cur.fetchall()
+
+            # Calculate total steps
+            cur.execute("""
+                SELECT SUM(
+                    COALESCE(uw.step_count, wt.default_step_count)
+                )
+                FROM public.workout_templates wt
+                LEFT JOIN public.user_workouts uw ON uw.template_id = wt.id AND uw.user_id = %s
+            """, (user_id,))
+            total_steps_row = cur.fetchone()
+            total_steps = int(total_steps_row[0]) if total_steps_row and total_steps_row[0] else 0
+
+            cur.close()
+
+        items = [
+            {
+                'template_id': str(row[0]),
+                'name': row[1],
+                'user_workout_id': str(row[2]) if row[2] else None,
+                'step_count': row[3],
+                'duration_minutes': row[4],
+                'editable_by_user': bool(row[5]),
+                'updated_at': row[6].isoformat() if row[6] else None
+            }
+            for row in rows
+        ]
+
+        return jsonify({'ok': True, 'workouts': items, 'total_steps': total_steps}), 200
+    except Exception as exc:
+        app.logger.exception('list_user_workouts: error')
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+@app.route('/api/users/<user_id>/workouts/<template_id>', methods=['GET'])
+def api_get_user_workout(user_id, template_id):
+    """Get current per-user row for a template (merged)."""
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT
+                    wt.id AS template_id,
+                    wt.name,
+                    uw.id AS user_workout_id,
+                    COALESCE(uw.step_count, wt.default_step_count) AS step_count,
+                    COALESCE(uw.duration_minutes, wt.default_duration_minutes) AS duration_minutes,
+                    wt.editable_by_user,
+                    uw.updated_at
+                FROM public.workout_templates wt
+                LEFT JOIN public.user_workouts uw ON uw.template_id = wt.id AND uw.user_id = %s
+                WHERE wt.id = %s
+            """, (user_id, template_id))
+            row = cur.fetchone()
+            cur.close()
+
+        if not row:
+            return jsonify({'ok': False, 'error': 'template_not_found'}), 404
+
+        workout = {
+            'template_id': str(row[0]),
+            'name': row[1],
+            'user_workout_id': str(row[2]) if row[2] else None,
+            'step_count': row[3],
+            'duration_minutes': row[4],
+            'editable_by_user': bool(row[5]),
+            'updated_at': row[6].isoformat() if row[6] else None
+        }
+
+        return jsonify({'ok': True, 'workout': workout}), 200
+    except Exception as exc:
+        app.logger.exception('get_user_workout: error')
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+@app.route('/api/users/<user_id>/workouts/<template_id>', methods=['PATCH'])
+def api_update_user_workout(user_id, template_id):
+    """Update user's step_count and/or duration_minutes. Saves previous state to history."""
+    # Owner-only: ensure caller is the same user
+    actor = _get_actor_user_id()
+    if not actor or str(actor) != str(user_id):
+        return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+    payload = request.get_json(force=True, silent=True) or {}
+
+    # Validate template is editable
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT editable_by_user FROM public.workout_templates WHERE id = %s", (template_id,))
+            template_row = cur.fetchone()
+            cur.close()
+
+        if not template_row:
+            return jsonify({'ok': False, 'error': 'template_not_found'}), 404
+
+        if not template_row[0]:
+            return jsonify({'ok': False, 'error': 'template_not_editable'}), 403
+    except Exception as exc:
+        app.logger.exception('update_user_workout: template check error')
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+    # Extract update fields
+    step_count = payload.get('step_count')
+    duration_minutes = payload.get('duration_minutes')
+    note = payload.get('note')
+
+    if step_count is None and duration_minutes is None:
+        return jsonify({'ok': False, 'error': 'no_updates'}), 400
+
+    # Validate values
+    if step_count is not None:
+        try:
+            step_count = int(step_count)
+            if step_count < 0 or step_count > 1000000:
+                return jsonify({'ok': False, 'error': 'invalid_step_count'}), 400
+        except (ValueError, TypeError):
+            return jsonify({'ok': False, 'error': 'invalid_step_count'}), 400
+
+    if duration_minutes is not None:
+        try:
+            duration_minutes = int(duration_minutes)
+            if duration_minutes < 0 or duration_minutes > 10000:
+                return jsonify({'ok': False, 'error': 'invalid_duration'}), 400
+        except (ValueError, TypeError):
+            return jsonify({'ok': False, 'error': 'invalid_duration'}), 400
+
+    # Transaction: save history + upsert user_workouts
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+
+            # Lock and get current values
+            cur.execute("""
+                SELECT id, step_count, duration_minutes
+                FROM public.user_workouts
+                WHERE user_id = %s AND template_id = %s
+                FOR UPDATE
+            """, (user_id, template_id))
+            current_row = cur.fetchone()
+
+            if current_row:
+                # Update existing record
+                user_workout_id = current_row[0]
+                old_step_count = current_row[1]
+                old_duration = current_row[2]
+
+                # Insert history record
+                cur.execute("""
+                    INSERT INTO public.workout_history
+                    (user_workout_id, user_id, template_id, step_count_before, step_count_after,
+                     duration_before, duration_after, changed_by, note)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    user_workout_id, user_id, template_id,
+                    old_step_count, step_count if step_count is not None else old_step_count,
+                    old_duration, duration_minutes if duration_minutes is not None else old_duration,
+                    actor, note
+                ))
+
+                # Update user_workouts
+                set_parts = []
+                update_params = []
+                if step_count is not None:
+                    set_parts.append("step_count = %s")
+                    update_params.append(step_count)
+                if duration_minutes is not None:
+                    set_parts.append("duration_minutes = %s")
+                    update_params.append(duration_minutes)
+                set_parts.append("updated_at = NOW()")
+                update_params.extend([user_workout_id])
+
+                cur.execute(f"""
+                    UPDATE public.user_workouts
+                    SET {', '.join(set_parts)}
+                    WHERE id = %s
+                    RETURNING id, step_count, duration_minutes, updated_at
+                """, tuple(update_params))
+                updated_row = cur.fetchone()
+            else:
+                # Insert new record (no previous values for history)
+                cur.execute("""
+                    INSERT INTO public.user_workouts (user_id, template_id, step_count, duration_minutes)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id, step_count, duration_minutes, updated_at
+                """, (user_id, template_id, step_count, duration_minutes))
+                updated_row = cur.fetchone()
+                user_workout_id = updated_row[0]
+
+                # Insert history with NULL before values
+                cur.execute("""
+                    INSERT INTO public.workout_history
+                    (user_workout_id, user_id, template_id, step_count_before, step_count_after,
+                     duration_before, duration_after, changed_by, note)
+                    VALUES (%s, %s, %s, NULL, %s, NULL, %s, %s, %s)
+                """, (user_workout_id, user_id, template_id, step_count, duration_minutes, actor, note))
+
+            # Calculate new total steps
+            cur.execute("""
+                SELECT SUM(
+                    COALESCE(uw.step_count, wt.default_step_count)
+                )
+                FROM public.workout_templates wt
+                LEFT JOIN public.user_workouts uw ON uw.template_id = wt.id AND uw.user_id = %s
+            """, (user_id,))
+            total_steps_row = cur.fetchone()
+            total_steps = int(total_steps_row[0]) if total_steps_row and total_steps_row[0] else 0
+
+            conn.commit()
+            cur.close()
+
+        result = {
+            'ok': True,
+            'user_workout_id': str(updated_row[0]),
+            'step_count': updated_row[1],
+            'duration_minutes': updated_row[2],
+            'updated_at': updated_row[3].isoformat() if updated_row[3] else None,
+            'total_steps': total_steps
+        }
+
+        return jsonify(result), 200
+    except Exception as exc:
+        app.logger.exception('update_user_workout: error')
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+@app.route('/api/users/<user_id>/workouts/<template_id>/history', methods=['GET'])
+def api_get_workout_history(user_id, template_id):
+    """List change history for user's template (descending by time)."""
+    # Owner-only (or allow read if history is not private)
+    actor = _get_actor_user_id()
+    if not actor or str(actor) != str(user_id):
+        return jsonify({'ok': False, 'error': 'forbidden', 'detail': 'actor must match user_id'}), 403
+
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT
+                    id, step_count_before, step_count_after,
+                    duration_before, duration_after,
+                    changed_at, changed_by, note
+                FROM public.workout_history
+                WHERE user_id = %s AND template_id = %s
+                ORDER BY changed_at DESC
+            """, (user_id, template_id))
+            rows = cur.fetchall()
+            cur.close()
+
+        items = [
+            {
+                'id': str(row[0]),
+                'step_count_before': row[1],
+                'step_count_after': row[2],
+                'duration_before': row[3],
+                'duration_after': row[4],
+                'changed_at': row[5].isoformat() if row[5] else None,
+                'changed_by': str(row[6]) if row[6] else None,
+                'note': row[7]
+            }
+            for row in rows
+        ]
+
+        return jsonify({'ok': True, 'history': items}), 200
+    except Exception as exc:
+        app.logger.exception('get_workout_history: error')
+        return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
 if __name__ == '__main__':
     os.makedirs(DATA_DIR, exist_ok=True)
     print('webapp.py: launching Flask on http://0.0.0.0:5000', flush=True)
