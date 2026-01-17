@@ -42,6 +42,9 @@ app = Flask(__name__, template_folder='templates')
 # Enable permissive CORS for now to allow frontend/dev access from any origin.
 # In production, restrict origins to your frontend domain(s).
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+# Limit maximum request body size (bytes) to avoid long blocking reads and DoS.
+# Adjust as appropriate for your image upload expectations.
+app.config.setdefault('MAX_CONTENT_LENGTH', 6 * 1024 * 1024)  # 6 MB
 
 # Configure logging to stdout so terminal shows logs reliably
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s', force=True)
@@ -683,7 +686,24 @@ def health_check():
 
 @app.route('/api/detect_face', methods=['POST'])
 def api_detect_face():
-    payload = request.get_json(force=True) if request.is_json else request.form.to_dict()
+    # Protect against very large request bodies and blocking reads.
+    max_len = app.config.get('MAX_CONTENT_LENGTH', 6 * 1024 * 1024)
+    content_length = request.content_length or 0
+    if content_length and content_length > max_len:
+        return jsonify({'ok': False, 'error': 'request_too_large'}), 413
+
+    # Parse JSON safely; avoid forcing a blocking read of the body.
+    try:
+        if request.content_type and request.content_type.startswith('application/json'):
+            payload = request.get_json(silent=True)
+            if payload is None:
+                return jsonify({'ok': False, 'error': 'invalid_json'}), 400
+        else:
+            # For form-encoded or other content types, fall back to form parsing.
+            payload = request.form.to_dict() if request.form else {}
+    except Exception as exc:
+        app.logger.exception('login_face: failed to parse request body')
+        return jsonify({'ok': False, 'error': 'bad_request', 'detail': str(exc)}), 400
     data_url = payload.get('face_image') or payload.get('image')
     if not data_url:
         return jsonify({'ok': False, 'error': 'missing_image'}), 400
