@@ -37,4 +37,4 @@ COPY . /app
 EXPOSE ${PORT}
 
 # Use gunicorn to serve the Flask app; webapp_new:app is the Flask app object
-CMD ["sh", "-c", "gunicorn -w 4 -b 0.0.0.0:${PORT} webapp_new:app"]
+CMD ["sh", "-c", "gunicorn -w 2 -k gthread --threads 4 --timeout 120 -b 0.0.0.0:${PORT} webapp_new:app"]
