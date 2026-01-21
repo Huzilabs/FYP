@@ -14,7 +14,7 @@ import json
 import numpy as np
 
 # Flask imports
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 
 load_dotenv()
@@ -2553,6 +2553,175 @@ def api_get_workout_history(user_id, template_id):
     except Exception as exc:
         app.logger.exception('get_workout_history: error')
         return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
+
+
+
+
+
+@app.route('/api/notifications/medications_due', methods=['GET', 'POST'])
+def api_notifications_medications_due():
+    """Admin/internal endpoint to trigger sending notifications for a slot/time.
+
+    Query params / JSON:
+      - slot=morning|afternoon|evening OR time=HH:MM
+    Optional header: X-Admin-Token must match NOTIFY_ADMIN_TOKEN when set.
+    """
+    # simple admin auth if configured
+    admin_token = os.getenv('NOTIFY_ADMIN_TOKEN')
+    if admin_token:
+        provided = request.headers.get('X-Admin-Token') or request.args.get('admin_token')
+        if provided != admin_token:
+            return jsonify({'ok': False, 'error': 'forbidden'}), 403
+
+    payload = request.get_json(silent=True) or {}
+    slot = request.args.get('slot') or payload.get('slot')
+    time_arg = request.args.get('time') or payload.get('time')
+
+    SLOTS = {'morning': '08:00', 'afternoon': '14:00', 'evening': '18:00'}
+    if slot:
+        slot_time = SLOTS.get(slot)
+        if not slot_time:
+            return jsonify({'ok': False, 'error': 'invalid_slot'}), 400
+    elif time_arg:
+        slot_time = time_arg
+    else:
+        return jsonify({'ok': False, 'error': 'missing_slot_or_time'}), 400
+
+    try:
+        created = 0
+        with db_conn() as conn:
+            cur = conn.cursor()
+            # Fetch meds without casting the `time` column (handles textual slots)
+            cur.execute("SELECT id as med_id, user_id, name, time FROM public.user_medications")
+            rows = cur.fetchall()
+            meds = []
+            for m in rows:
+                tval = m[3]
+                if tval is None:
+                    continue
+                tstr = str(tval)
+                if ':' in tstr:
+                    parts = tstr.split(':')
+                    if len(parts) >= 2:
+                        hh = parts[0].zfill(2)
+                        mm = parts[1]
+                        norm = f"{hh}:{mm}"
+                    else:
+                        continue
+                    if norm == slot_time:
+                        meds.append(m)
+                    continue
+                if tstr.lower() in SLOTS and SLOTS[tstr.lower()] == slot_time:
+                    meds.append(m)
+
+            for m in meds:
+                med_id = m[0]
+                user_id = m[1]
+                title = f"Medication reminder: {m[2] or 'Medication'}"
+                body = 'Time to take your medication.'
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO public.medication_notifications_log (user_medication_id, scheduled_date, scheduled_time)
+                        VALUES (%s, CURRENT_DATE, %s)
+                        ON CONFLICT DO NOTHING
+                        RETURNING id
+                        """,
+                        (med_id, slot_time),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        cur.execute(
+                            """
+                            INSERT INTO public.user_notifications (user_id, title, body, payload)
+                            VALUES (%s, %s, %s, %s)
+                            RETURNING id
+                            """,
+                            (user_id, title, body, json.dumps({'med_id': str(med_id), 'slot': slot_time}))
+                        )
+                        _ = cur.fetchone()
+                        created += 1
+                except Exception:
+                    conn.rollback()
+                else:
+                    conn.commit()
+
+        return jsonify({'ok': True, 'found': len(meds), 'created': created}), 200
+    except Exception as exc:
+        app.logger.exception('notifications trigger error')
+        return jsonify({'ok': False, 'error': 'server_error', 'detail': str(exc)}), 500
+
+
+@app.route('/api/users/<user_id>/notifications', methods=['GET'])
+def api_list_user_notifications(user_id):
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id, title, body, payload, created_at, delivered, read_at FROM public.user_notifications WHERE user_id=%s ORDER BY created_at DESC LIMIT 200", (user_id,))
+            rows = cur.fetchall()
+            cur.close()
+
+        items = [
+            {
+                'id': str(r[0]),
+                'title': r[1],
+                'body': r[2],
+                'payload': r[3],
+                'created_at': r[4].isoformat() if r[4] else None,
+                'delivered': bool(r[5]),
+                'read_at': r[6].isoformat() if r[6] else None,
+            }
+            for r in rows
+        ]
+        return jsonify({'ok': True, 'notifications': items}), 200
+    except Exception as exc:
+        app.logger.exception('list notifications error')
+        return jsonify({'ok': False, 'error': 'server_error', 'detail': str(exc)}), 500
+
+
+@app.route('/api/users/<user_id>/notifications/stream', methods=['GET'])
+def api_stream_user_notifications(user_id):
+    def event_stream():
+        try:
+            while True:
+                with db_conn() as conn:
+                    cur = conn.cursor()
+                    # Atomically select pending notifications and mark them delivered
+                    sql = """
+                    WITH to_send AS (
+                        SELECT id FROM public.user_notifications
+                        WHERE user_id = %s AND delivered = FALSE
+                        ORDER BY created_at ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 50
+                    )
+                    UPDATE public.user_notifications u
+                    SET delivered = TRUE
+                    FROM to_send
+                    WHERE u.id = to_send.id
+                    RETURNING u.id, u.title, u.body, u.payload, u.created_at
+                    """
+                    cur.execute(sql, (user_id,))
+                    rows = cur.fetchall()
+                    if rows:
+                        # commit the delivered flag before sending to avoid re-delivery
+                        conn.commit()
+                        for r in rows:
+                            payload = {
+                                'id': str(r[0]),
+                                'title': r[1],
+                                'body': r[2],
+                                'payload': r[3],
+                                'created_at': r[4].isoformat() if r[4] else None,
+                            }
+                            yield f"data: {json.dumps(payload)}\n\n"
+                time.sleep(1)
+        except GeneratorExit:
+            return
+        except Exception:
+            return
+
+    return Response(stream_with_context(event_stream()), mimetype='text/event-stream')
 
 
 if __name__ == '__main__':
