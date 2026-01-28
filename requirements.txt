@@ -11,3 +11,5 @@ requests
 Flask-Cors
 gunicorn
 setuptools<81
+backports.zoneinfo; python_version < '3.9'
+tzdata

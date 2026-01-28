@@ -2555,9 +2555,6 @@ def api_get_workout_history(user_id, template_id):
         return jsonify({'ok': False, 'error': 'db_error', 'detail': str(exc)}), 500
 
 
-
-
-
 @app.route('/api/notifications/medications_due', methods=['GET', 'POST'])
 def api_notifications_medications_due():
     """Admin/internal endpoint to trigger sending notifications for a slot/time.
@@ -2686,39 +2683,80 @@ def api_stream_user_notifications(user_id):
             while True:
                 with db_conn() as conn:
                     cur = conn.cursor()
-                    # Atomically select pending notifications and mark them delivered
+                    # Select pending notifications without marking delivered yet
                     sql = """
-                    WITH to_send AS (
-                        SELECT id FROM public.user_notifications
-                        WHERE user_id = %s AND delivered = FALSE
-                        ORDER BY created_at ASC
-                        FOR UPDATE SKIP LOCKED
-                        LIMIT 50
-                    )
-                    UPDATE public.user_notifications u
-                    SET delivered = TRUE
-                    FROM to_send
-                    WHERE u.id = to_send.id
-                    RETURNING u.id, u.title, u.body, u.payload, u.created_at
+                    SELECT id, title, body, payload, created_at
+                    FROM public.user_notifications
+                    WHERE user_id = %s AND delivered = FALSE
+                    ORDER BY created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 10
                     """
                     cur.execute(sql, (user_id,))
                     rows = cur.fetchall()
+                    
                     if rows:
-                        # commit the delivered flag before sending to avoid re-delivery
-                        conn.commit()
-                        for r in rows:
-                            payload = {
-                                'id': str(r[0]),
+                        # Copy rows out of the locked transaction and release the lock
+                        # so we don't hold row locks while streaming to the client.
+                        to_send = [
+                            {
+                                'id': r[0],
                                 'title': r[1],
                                 'body': r[2],
                                 'payload': r[3],
                                 'created_at': r[4].isoformat() if r[4] else None,
                             }
-                            yield f"data: {json.dumps(payload)}\n\n"
-                time.sleep(1)
+                            for r in rows
+                        ]
+                        try:
+                            # Release the select transaction and its locks before streaming
+                            conn.commit()
+                        except Exception:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+
+                        # Yield each notification, then mark it delivered in a short-lived
+                        # separate transaction so we only set `delivered = TRUE` for
+                        # notifications actually sent.
+                        for item in to_send:
+                            data_str = f"data: {json.dumps(item)}\n\n"
+                            try:
+                                yield data_str
+                            except GeneratorExit:
+                                # Client disconnected while streaming; stop without marking
+                                return
+                            except Exception as e:
+                                app.logger.error(f"Error yielding notification {item.get('id')}: {e}")
+                                # don't mark delivered if we couldn't yield
+                                continue
+
+                            # After successful yield, mark delivered with a fresh connection
+                            try:
+                                with db_conn() as update_conn:
+                                    ucur = update_conn.cursor()
+                                    ucur.execute(
+                                        "UPDATE public.user_notifications SET delivered = TRUE WHERE id = %s",
+                                        (item['id'],)
+                                    )
+                                    update_conn.commit()
+                                    try:
+                                        ucur.close()
+                                    except Exception:
+                                        pass
+                            except Exception as e:
+                                app.logger.error(f"Error marking notification {item.get('id')} as delivered: {e}")
+
+                        # Small delay after sending batch
+                        time.sleep(0.1)
+                    else:
+                        # No notifications, wait longer
+                        time.sleep(2)
         except GeneratorExit:
             return
-        except Exception:
+        except Exception as e:
+            app.logger.error(f"SSE stream error: {e}")
             return
 
     return Response(stream_with_context(event_stream()), mimetype='text/event-stream')
