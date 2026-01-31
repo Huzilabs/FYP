@@ -1,0 +1,2 @@
+Face Recognition + Medication Reminders — final branch created.
+Please review `requirements.txt` and `Dockerfile`; all other tracked files are archived in `archived_ignored/` for a minimal deliverable.

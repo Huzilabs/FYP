@@ -1,3 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+env/
+
+# Node
+node_modules/
+
+# Archive folder for final branch
+archived_ignored/
+
+# Editor/temp
+.vscode/
+*.swp
 .env
 *.env.local
 venv/

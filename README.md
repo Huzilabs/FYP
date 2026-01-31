@@ -1,3 +1,67 @@
+# Face Recognition + Medication Reminders
+
+Brief
+-----
+This repository implements a Flask-based backend for face recognition and a medication reminders system. It includes an SSE-based notification stream for clients and an Edge Function that the scheduler calls to create deduplicated, persisted medication reminders.
+
+Tech stack
+----------
+- Python 3.10+ with Flask
+- PostgreSQL (Supabase) for data storage and RPCs
+- Optional: pgvector for nearest-neighbor face search
+- Deno (Edge Functions) for the scheduler/admin notify function
+- Docker for containerized deployment
+
+Quick start (local)
+-------------------
+1. Install Python dependencies:
+
+   pip install -r requirements.txt
+
+2. Create a `.env` (or set environment variables):
+
+   SUPABASE_DB_URL='postgres://...'
+   SUPABASE_URL='https://...'
+   SUPABASE_SERVICE_ROLE_KEY='...'
+   SUPABASE_BUCKET='your-bucket'
+   NOTIFY_ADMIN_TOKEN='a-secret-token'
+
+3. Run the app locally:
+
+   python webapp_new.py
+
+4. Expose or configure a public host (Railway, Docker, etc.) and set the same env vars in production.
+
+Run with Docker
+---------------
+Build and run:
+
+```bash
+docker build -t face-backend .
+docker run -e SUPABASE_DB_URL='...' -e NOTIFY_ADMIN_TOKEN='...' -p 5000:5000 face-backend
+```
+
+Scheduler / Edge function
+-------------------------
+- Deploy `functions/notify-medications` as a Supabase Edge Function or any Deno-capable host.
+- Configure your scheduler to POST JSON to `/api/notifications/medications_due` with body `{"slot":"morning","token":"<TOKEN>"}` and set timezone to Europe/London.
+
+Important files
+---------------
+- `webapp_new.py`: Main Flask app and SSE stream.
+- `functions/notify-medications/index.ts`: Scheduler entrypoint that creates deduped notifications.
+- `migrations/`: SQL migrations and RPCs to run on your Supabase DB.
+- `scripts/notifications_audit_and_checks.sql`: Audit and diagnostic queries.
+- `requirements.txt`, `Dockerfile`: kept in the final branch for running and deploying.
+
+Troubleshooting
+---------------
+- If scheduled runs produce no notifications, verify the scheduler uses `POST` with JSON body and correct `token`.
+- Use the audit SQL in `scripts/notifications_audit_and_checks.sql` to inspect delivered updates and to debug who marked notifications delivered.
+
+License
+-------
+Check repository or project owner for licensing details.
 # Face Recognition Flask API
 
 ## Overview
