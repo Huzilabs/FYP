@@ -71,6 +71,73 @@
 - `GET /api/users/<user_id>/notifications/stream`: Server-Sent Events (SSE) stream of pending notifications; notifications are marked `delivered` only after successful streaming.
 - `GET/POST /api/notifications/medications_due`: Admin internal endpoint used by scheduler to create deduped medication notifications. Accepts `slot=morning|afternoon|evening` or `time=HH:MM` and requires `X-Admin-Token` header or JSON `token` when `NOTIFY_ADMIN_TOKEN` is set.
 
+Endpoint details
+----------------
+
+- `GET /health`
+   - Purpose: Return app liveness and quick checks for DB and face model availability.
+   - Inputs: none.
+   - Auth: none.
+   - Response: JSON `{ok: true, db: {connected: bool}, face_model: {available: bool}}`.
+
+- `POST /api/detect_face`
+   - Purpose: Run face detection on an uploaded image (no DB writes).
+   - Inputs: JSON body with `face_image` (data URL) or `image` (HTTP URL or storage path).
+   - Auth: none.
+   - Response: JSON with detected face bounding boxes.
+
+- `POST /api/upload_face_temp`
+   - Purpose: Save an uploaded image to temp storage and return a usable URL.
+   - Inputs: `face_image` (data URL) or `image`.
+   - Auth: none.
+   - Response: `temp_storage_path`, `public_url`, and a preview data URL.
+
+- `POST /api/capture_face`
+   - Purpose: Attach a face image to a user record and optionally compute/store an embedding.
+   - Inputs: `user_id` (optional), `face_image` or `temp_storage_path`.
+   - Auth: none for capture-first; embedding and DB writes happen server-side.
+   - Response: `profile_image_url`, `storage_path`.
+
+- `POST /api/register`
+   - Purpose: Create or update a user and optionally persist supplied medications.
+   - Inputs: JSON with `display_name`, `username`, `consent_terms` and other profile fields.
+   - Auth: none (intended for frontend registration flow).
+   - Response: created user id and display name.
+
+- `POST /api/attach_image`
+   - Purpose: Attach an image to an existing user and compute embedding separately.
+   - Inputs: `user_id` plus `face_image` or `temp_storage_path`.
+   - Auth: owner-only via `X-User-Id` or `actor_user_id`.
+
+- `POST /api/login_face`
+   - Purpose: Face-login via nearest-neighbor search using embeddings (requires pgvector).
+   - Inputs: `face_image` or `temp_storage_path`; optional `threshold` and `limit`.
+   - Auth: none; returns matched `user` when distance below threshold.
+
+- `GET /api/admin/embeddings`
+   - Purpose: Admin helper to list embeddings (local testing only).
+   - Inputs: `user_id` query param.
+   - Auth: not enforced (local/dev use only).
+
+- `GET/PUT/DELETE /api/users/<user_id>`
+   - Purpose: CRUD for user profile (GET returns profile, images, meds, embedding count).
+   - Inputs: path `user_id`; PUT body contains allowed fields.
+   - Auth: owner-only — require `X-User-Id` header or `actor_user_id` to match `user_id`.
+
+- Medications endpoints (`/api/users/<user_id>/medications`)
+   - Purpose: List, create, update and delete medication rows tied to a user. `time` field supports slots or `HH:MM`.
+   - Auth: owner-only for create/update/delete.
+
+- Notifications endpoints
+   - `GET /api/users/<user_id>/notifications`: list persisted notification rows (owner-only).
+   - `GET /api/users/<user_id>/notifications/stream`: SSE stream for pending notifications; server marks each row `delivered` only after successful streaming.
+
+- `GET/POST /api/notifications/medications_due`
+   - Purpose: Admin/internal scheduler endpoint. Creates deduped rows in `medication_notifications_log` and `user_notifications` for the requested slot/time.
+   - Inputs: query or JSON `slot=morning|afternoon|evening` or `time=HH:MM`. Optional JSON `cleanup=true` to run cleanup RPCs.
+   - Auth: If `NOTIFY_ADMIN_TOKEN` is set, request must include `X-Admin-Token` header or JSON `token` matching the env var.
+
+
 ## Notes
 
 - This branch will keep only `requirements.txt` and `Dockerfile` tracked; other project files are archived into `archived_ignored/` to produce a minimal final branch. You can restore archived files from that folder if needed.
